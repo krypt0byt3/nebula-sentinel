@@ -12,34 +12,44 @@ archive repo under the git tag **`pre-reorg-snapshot`** (path `sentinel_v2/`).
 This file tracks porting them in, deliberately, so the port doesn't collide with
 in-flight Windows work already underway in nebula-agent.
 
-## To port (ranked)
+## Status
 
-1. **Windows hardening breadth** (the main gap). From `sentinel_v2/src`:
-   - `response/mod.rs` — Windows process-tree kill (`taskkill /F /T`), Windows
-     Firewall (`netsh advfirewall`), `is_protected_pid`, platform-aware
-     quarantine/isolation/blocked-IP paths.
-   - `network_monitor/mod.rs` — Windows DNS monitoring for DGA/fast-flux via
-     `wevtutil` on `Microsoft-Windows-DNS-Client/Operational`.
-   - `forensics/mod.rs` — Windows Event Log channel export via `wevtutil`,
-     Windows fd-list and metadata-only memory snapshot.
-   - `platform.rs` — `set_models_dir_override`, `set_active_config_path`,
-     `active_config_path` runtime overrides.
-   - `collector/windows_parse.rs` — Event Log XML parsing factored into a
-     unit-testable module (new file; wire into `collector/windows.rs`).
-   - ⚠️ Reconcile with nebula-agent's own in-flight Windows work
-     (`docs/agent/08_windows.md`, `platform.rs`) before overwriting anything.
+### ✅ Done
+- **ATC self-test harness** — `src/atc_selftest.rs` + `--atc-test` /
+  `--atc-scenario` CLI. Drives real `ThreatEvent`s through
+  `LLMEngine::analyze_threat` and scores completion / verdict accuracy / recall
+  vs. specificity / latency. (The BitNet token-stats hook was dropped — stock
+  llama.cpp doesn't expose it.)
+- **Windows hardening breadth** — ported from sentinel_v2 (verified supersets,
+  no body-vs-body collisions):
+  - `response/mod.rs` — `taskkill /F /T` process-tree kill, `is_protected_pid`,
+    platform-resolved quarantine/isolation/blocked-IP paths (hardcoded
+    `/var/lib/nebula` → `platform::data_dir()`; non-Windows behavior preserved).
+  - `forensics/mod.rs` — Windows twins for every collector (`wevtutil` Event Log
+    export, `tasklist`/`netstat -ano`/`ipconfig` triage, metadata-only memory
+    snapshot); `capture_pcap` now tshark → tcpdump (Unix) / pktmon (Windows).
+  - `network_monitor/mod.rs` — Windows DNS via `wevtutil` on
+    `Microsoft-Windows-DNS-Client/Operational` (+ `Get-DnsClientCache` fallback).
+  - `platform.rs` — `set_models_dir_override` + `models_dir()` override, wired
+    into `main`'s `--models-dir`.
+  - ⚠️ The `#[cfg(windows)]` code is parsed and ported verbatim but was only
+    **type-checked on the non-Windows paths here**. A Windows build must verify it.
 
-2. **ATC self-test harness** — `sentinel_v2/src/atc_selftest.rs` (636 LOC) +
-   the `--atc-test` / `--atc-scenario` CLI. Clean, self-contained add; it is the
-   harness that measures model discrimination against labelled scenarios.
-
-3. **LLM prompt-robustness** — from `sentinel_v2/src/llm/mod.rs`:
-   `AtcPromptVariant`, `verdict_from_prose`, tolerant `json_bool`,
-   `collect_technique_ids` / `is_mitre_technique_id` (MITRE recovery from nested
-   JSON), `raw_generate` + `--llm-inference-test`, `--list-models`. Port
-   selectively and reconcile with this repo's engine-aware / Qwen3 selection
-   logic — `llm/mod.rs` is the one real merge-conflict zone (both sides rewrote
-   it heavily).
+### ⏳ Remaining
+- **LLM prompt-robustness** (`src/llm/mod.rs` — the real conflict zone, both
+  sides rewrote it): `AtcPromptVariant`, `verdict_from_prose`, tolerant
+  `json_bool`, `collect_technique_ids` / `is_mitre_technique_id`, `raw_generate`
+  + `--llm-inference-test`, local `--list-models`. Must fold in WITHOUT regressing
+  this repo's Qwen3 catalog / engine-aware selection.
+- **`platform.rs` config-path overrides** — `set_active_config_path` /
+  `active_config_path` (fixes a Windows in-place config-write bug). Deferred: only
+  useful once the mode-change handlers (SetMode/ApplyPolicy) call
+  `active_config_path()` instead of a hardcoded path — caller wiring in `main`
+  and the handlers, out of scope of the file-level port.
+- **`collector/windows_parse.rs`** — the unit-testable Event Log XML parser.
+  Deferred with the `collector/windows.rs` rewiring (nebula-agent's `windows.rs`
+  has its own inline parsing; swapping it for the testable module is the real win
+  and is Windows-gated).
 
 ## Explicitly NOT porting
 

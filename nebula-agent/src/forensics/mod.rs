@@ -174,6 +174,66 @@ impl ForensicsEngine {
     }
 
     // ── Process triage ─────────────────────────────────────────
+    #[cfg(target_os = "windows")]
+    async fn collect_process_triage(
+        &self,
+        dir: &Path,
+        pid: u32,
+    ) -> Result<ArtifactMeta> {
+        // Windows has no /proc, so the same three facts (process tree, the
+        // subject PID's command line and parentage, live connections) come from
+        // tasklist, CIM and netstat. Without this the whole bundle came back
+        // empty on Windows: every collector below shells out to a Linux tool.
+        let mut output = String::new();
+
+        if let Ok(t) = Command::new("tasklist").args(["/v", "/fo", "list"]).output().await {
+            output.push_str("=== PROCESS LIST (tasklist /v) ===\n");
+            output.push_str(&String::from_utf8_lossy(&t.stdout));
+        }
+
+        if pid > 0 {
+            // Win32_Process carries CommandLine, ExecutablePath and
+            // ParentProcessId — the Windows analogue of /proc/<pid>/cmdline
+            // plus the parent link.
+            let ps_cmd = format!(
+                "Get-CimInstance Win32_Process -Filter 'ProcessId={}' | \
+                 Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate | \
+                 Format-List",
+                pid);
+            if let Ok(o) = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+                .output().await
+            {
+                output.push_str(&format!("\n=== PID {} DETAIL ===\n", pid));
+                output.push_str(&String::from_utf8_lossy(&o.stdout));
+            }
+            // Loaded modules — the closest available stand-in for /proc/<pid>/maps
+            // and the place an injected/side-loaded DLL shows up.
+            let mod_cmd = format!(
+                "Get-Process -Id {} -ErrorAction SilentlyContinue | \
+                 Select-Object -ExpandProperty Modules | \
+                 Select-Object ModuleName,FileName,FileVersion | Format-Table -AutoSize",
+                pid);
+            if let Ok(o) = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &mod_cmd])
+                .output().await
+            {
+                output.push_str(&format!("\n=== PID {} LOADED MODULES ===\n", pid));
+                output.push_str(&String::from_utf8_lossy(&o.stdout));
+            }
+        }
+
+        if let Ok(n) = Command::new("netstat").args(["-ano"]).output().await {
+            output.push_str("\n=== ACTIVE CONNECTIONS (netstat -ano) ===\n");
+            output.push_str(&String::from_utf8_lossy(&n.stdout));
+        }
+
+        let path = dir.join("process_triage.txt");
+        fs::write(&path, &output)?;
+        Ok(make_artifact_meta("process_triage", &path, "Process list, PID detail, modules, connections"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
     async fn collect_process_triage(
         &self,
         dir: &Path,
@@ -217,6 +277,35 @@ impl ForensicsEngine {
     }
 
     // ── Network state ──────────────────────────────────────────
+    #[cfg(target_os = "windows")]
+    async fn collect_network_state(&self, dir: &Path) -> Result<ArtifactMeta> {
+        let mut output = String::new();
+
+        for cmd_args in &[
+            vec!["netstat", "-ano"],
+            vec!["arp", "-a"],
+            vec!["route", "print"],
+            vec!["ipconfig", "/all"],
+            vec!["ipconfig", "/displaydns"],
+            // Profile-level firewall state; the full rule dump is far too large
+            // to put in every bundle.
+            vec!["netsh", "advfirewall", "show", "allprofiles"],
+        ] {
+            if let Ok(out) = Command::new(cmd_args[0])
+                .args(&cmd_args[1..]).output().await
+            {
+                output.push_str(&format!("\n=== {} ===\n", cmd_args.join(" ")));
+                output.push_str(&String::from_utf8_lossy(&out.stdout));
+            }
+        }
+
+        let path = dir.join("network_state.txt");
+        fs::write(&path, &output)?;
+        Ok(make_artifact_meta("network_state", &path,
+            "Connections, ARP, routes, DNS cache, firewall profiles"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
     async fn collect_network_state(&self, dir: &Path) -> Result<ArtifactMeta> {
         let mut output = String::new();
 
@@ -240,6 +329,59 @@ impl ForensicsEngine {
     }
 
     // ── Log slice ──────────────────────────────────────────────
+    /// On Windows `log_paths` from the config point at Unix files that do not
+    /// exist, so a literal reading of the config collected nothing. Instead we
+    /// treat each configured entry as an Event Log CHANNEL name when it is not
+    /// a real file — "Security", "System", "Application", or any
+    /// Microsoft-Windows-*/Operational channel — and export it with wevtutil.
+    #[cfg(target_os = "windows")]
+    async fn collect_log_slice(
+        &self,
+        dir: &Path,
+        log_path: &str,
+        _around: &chrono::DateTime<Utc>,
+    ) -> Result<ArtifactMeta> {
+        let log = Path::new(log_path);
+        if log.exists() {
+            // A genuine file on disk (e.g. an application log the operator
+            // pointed us at): take its tail without a Unix `tail`.
+            let content = fs::read_to_string(log).unwrap_or_default();
+            let tail: String = {
+                let lines: Vec<&str> = content.lines().collect();
+                let start = lines.len().saturating_sub(500);
+                lines[start..].join("\r\n")
+            };
+            let fname = log.file_name().map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "log".to_string());
+            let slice_path = dir.join(format!("log_slice_{}.txt", fname));
+            fs::write(&slice_path, tail)?;
+            return Ok(make_artifact_meta("log_slice", &slice_path,
+                &format!("Log slice from {}", log_path)));
+        }
+
+        // Not a file — treat it as an Event Log channel. A configured Unix path
+        // maps onto the channel that carries the equivalent telemetry.
+        let channel = match log_path {
+            "/var/log/auth.log" | "/var/log/secure" => "Security",
+            "/var/log/syslog" | "/var/log/messages" => "System",
+            other => other.trim_start_matches('/'),
+        };
+
+        let out = Command::new("wevtutil")
+            .args(["qe", channel, "/c:500", "/rd:true", "/f:text"])
+            .output().await?;
+        if !out.status.success() {
+            anyhow::bail!("wevtutil could not read channel '{}'", channel);
+        }
+
+        let safe = channel.replace(['/', '\\', ':'], "_");
+        let slice_path = dir.join(format!("eventlog_{}.txt", safe));
+        fs::write(&slice_path, &out.stdout)?;
+        Ok(make_artifact_meta("log_slice", &slice_path,
+            &format!("Last 500 records of the {} event log channel", channel)))
+    }
+
+    #[cfg(not(target_os = "windows"))]
     async fn collect_log_slice(
         &self,
         dir: &Path,
@@ -266,6 +408,61 @@ impl ForensicsEngine {
     }
 
     // ── File descriptor list ───────────────────────────────────
+    /// Windows has no /proc/<pid>/fd and no built-in handle enumerator
+    /// (Sysinternals `handle.exe` is a separate download we will not assume).
+    /// We collect what IS available without extra tooling: the process's open
+    /// FILES via its loaded modules, plus network handles from netstat, plus
+    /// shared-file handles from `openfiles` when the operator has enabled it.
+    #[cfg(target_os = "windows")]
+    async fn collect_fd_list(&self, dir: &Path, pid: u32) -> Result<ArtifactMeta> {
+        let mut output = String::new();
+
+        if pid > 0 {
+            let cmd = format!(
+                "Get-Process -Id {} -ErrorAction SilentlyContinue | \
+                 Select-Object -ExpandProperty Modules | \
+                 Select-Object FileName | Format-Table -AutoSize -HideTableHeaders",
+                pid);
+            if let Ok(o) = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
+                .output().await
+            {
+                output.push_str(&format!("=== PID {} mapped image files ===\n", pid));
+                output.push_str(&String::from_utf8_lossy(&o.stdout));
+            }
+
+            if let Ok(o) = Command::new("netstat").args(["-ano"]).output().await {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let needle = format!(" {}", pid);
+                output.push_str(&format!("\n=== PID {} network handles ===\n", pid));
+                for line in text.lines() {
+                    if line.trim_end().ends_with(&needle) { output.push_str(line); output.push('\n'); }
+                }
+            }
+        }
+
+        // `openfiles` only reports handles to files opened over SMB shares, and
+        // only when local handle accounting has been switched on. It is still
+        // worth capturing when present; it is never an error when it is not.
+        if let Ok(o) = Command::new("openfiles").args(["/query", "/fo", "list"]).output().await {
+            if o.status.success() {
+                output.push_str("\n=== SHARED-FILE HANDLES (openfiles) ===\n");
+                output.push_str(&String::from_utf8_lossy(&o.stdout));
+            }
+        }
+
+        if output.trim().is_empty() {
+            output.push_str("No handle information available. Windows exposes no \
+                             built-in per-process handle listing; install Sysinternals \
+                             handle.exe for full handle enumeration.\n");
+        }
+
+        let path = dir.join("open_files.txt");
+        fs::write(&path, &output)?;
+        Ok(make_artifact_meta("open_files", &path, "Mapped images and network handles"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
     async fn collect_fd_list(&self, dir: &Path, pid: u32) -> Result<ArtifactMeta> {
         let mut output = String::new();
         if pid > 0 {
@@ -291,6 +488,55 @@ impl ForensicsEngine {
     }
 
     // ── Memory snapshot (lightweight) ─────────────────────────
+    /// Windows equivalent of the Linux metadata-only snapshot.
+    ///
+    /// A full physical-memory dump on Windows needs a kernel driver (WinPmem,
+    /// Comae, or an admin-triggered crash dump) that we do not ship, so this is
+    /// deliberately a bounded, metadata-only capture — the same honest posture
+    /// as the no-LiME path on Linux, rather than an artifact named
+    /// "memory_dump" that contains nothing.
+    #[cfg(target_os = "windows")]
+    async fn collect_memory_snapshot(&self, dir: &Path) -> Result<ArtifactMeta> {
+        warn!("💾 Forensics: initiating memory snapshot (Windows: metadata-only)");
+        let mut summary = String::new();
+        summary.push_str("=== MEMORY SNAPSHOT (metadata-only) ===\n\n\
+            A raw physical-memory image requires a kernel acquisition driver\n\
+            (e.g. WinPmem) which this agent does not ship. Captured below is\n\
+            system memory state and the largest resident processes.\n\n");
+
+        if let Ok(o) = Command::new("systeminfo").output().await {
+            let text = String::from_utf8_lossy(&o.stdout);
+            summary.push_str("--- systeminfo (memory lines) ---\n");
+            for line in text.lines() {
+                let l = line.to_lowercase();
+                if l.contains("memory") || l.contains("page file") {
+                    summary.push_str(line); summary.push('\n');
+                }
+            }
+            summary.push('\n');
+        }
+
+        // Top 100 processes by working set — the Windows analogue of VmRSS.
+        let cmd = "Get-Process | Sort-Object WorkingSet64 -Descending | \
+                   Select-Object -First 100 Id,ProcessName,\
+                   @{Name='WorkingSetKB';Expression={[int]($_.WorkingSet64/1KB)}},\
+                   @{Name='PrivateKB';Expression={[int]($_.PrivateMemorySize64/1KB)}} | \
+                   Format-Table -AutoSize";
+        if let Ok(o) = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", cmd])
+            .output().await
+        {
+            summary.push_str("--- top-100 processes by working set ---\n");
+            summary.push_str(&String::from_utf8_lossy(&o.stdout));
+        }
+
+        let path = dir.join("memory.txt");
+        fs::write(&path, summary.as_bytes())?;
+        Ok(make_artifact_meta("memory_summary", &path,
+            "Bounded memory metadata summary (system memory + top-100 working set; no raw dump)"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
     async fn collect_memory_snapshot(&self, dir: &Path) -> Result<ArtifactMeta> {
         warn!("💾 Forensics: initiating memory snapshot");
 
@@ -451,26 +697,79 @@ async fn capture_pcap(dir: &Path, filter: &str, duration_secs: u64) {
     let out_path = dir.join("capture.pcap");
     info!("🎣 PCAP: capturing {}s with filter '{}'", duration_secs, filter);
 
-    // Try tshark first, fall back to tcpdump
-    let result = Command::new("tshark")
-        .args([
-            "-a", &format!("duration:{}", duration_secs),
-            "-f", filter,
-            "-w", &out_path.to_string_lossy(),
-        ])
-        .output().await;
+    // tshark is the first choice on every platform (it ships with Wireshark and
+    // is the only one of these that honours a BPF filter identically everywhere).
+    let ok = matches!(
+        Command::new("tshark")
+            .args([
+                "-a", &format!("duration:{}", duration_secs),
+                "-f", filter,
+                "-w", &out_path.to_string_lossy(),
+            ])
+            .output().await,
+        Ok(o) if o.status.success()
+    );
 
-    if result.is_err() {
-        let _ = Command::new("tcpdump")
+    #[cfg(not(target_os = "windows"))]
+    let ok = ok || matches!(
+        Command::new("tcpdump")
             .args([
                 "-G", &duration_secs.to_string(),
                 "-W", "1",
                 "-f", filter,
                 "-w", &out_path.to_string_lossy(),
             ])
-            .output().await;
+            .output().await,
+        Ok(o) if o.status.success()
+    );
+
+    // Windows fallback: pktmon, built into Windows 10 1809+ and Server 2019+.
+    // It writes ETL, so convert to pcapng afterwards. pktmon has no BPF filter
+    // syntax, so the configured filter cannot be applied here — say so rather
+    // than silently capturing something different from what was asked for.
+    #[cfg(target_os = "windows")]
+    let ok = {
+        let mut ok = ok;
+        if !ok {
+            let etl = dir.join("capture.etl");
+            if !filter.trim().is_empty() {
+                warn!("🎣 PCAP: falling back to pktmon — the BPF filter '{}' cannot be \
+                       applied (pktmon has no BPF syntax); capturing unfiltered", filter);
+            }
+            let started = matches!(
+                Command::new("pktmon")
+                    .args(["start", "--capture", "--pkt-size", "0",
+                           "-f", &etl.to_string_lossy()])
+                    .output().await,
+                Ok(o) if o.status.success()
+            );
+            if started {
+                tokio::time::sleep(std::time::Duration::from_secs(duration_secs)).await;
+                let _ = Command::new("pktmon").arg("stop").output().await;
+                ok = matches!(
+                    Command::new("pktmon")
+                        .args(["etl2pcap", &etl.to_string_lossy(),
+                               "-o", &out_path.to_string_lossy()])
+                        .output().await,
+                    Ok(o) if o.status.success()
+                );
+                if !ok {
+                    // Conversion failed but the ETL is still evidence — keep it.
+                    warn!("🎣 PCAP: pktmon etl2pcap failed; the raw ETL capture is \
+                           retained at {}", etl.display());
+                }
+            }
+        }
+        ok
+    };
+
+    if ok {
+        info!("🎣 PCAP saved → {}", out_path.display());
+    } else {
+        warn!("🎣 PCAP: no capture tool succeeded (tried tshark{}). \
+               Install Wireshark/tshark for packet capture on this host.",
+              if cfg!(target_os = "windows") { ", pktmon" } else { ", tcpdump" });
     }
-    info!("🎣 PCAP saved → {}", out_path.display());
 }
 
 fn make_artifact_meta(artifact_type: &str, path: &Path, description: &str) -> ArtifactMeta {

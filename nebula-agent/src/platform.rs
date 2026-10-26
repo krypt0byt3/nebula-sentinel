@@ -56,13 +56,30 @@ pub fn agent_id_path() -> PathBuf {
     data_dir().join("agent_id")
 }
 
+/// Process-wide override for the models directory, set once from `--models-dir`
+/// (see `set_models_dir_override`). A static rather than a threaded-through
+/// parameter because model discovery happens deep inside the LLM backends —
+/// every caller of `models_dir()` has to agree on the answer, including the
+/// self-test child process and the downloader.
+static MODELS_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Point every models-dir lookup in this process at `dir`. First call wins;
+/// returns the directory now in effect. Call before the LLM engine is built.
+pub fn set_models_dir_override(dir: impl Into<PathBuf>) -> PathBuf {
+    let dir = dir.into();
+    MODELS_DIR_OVERRIDE.get_or_init(|| dir).clone()
+}
+
 /// Directory for downloaded LLM model files.
 ///
-/// `NEBULA_MODELS_DIR` (also set by `--models-dir`) overrides it, so an operator
-/// can keep GGUFs on a data volume without editing the config. Everything that
-/// looks for a model — download, auto-detect, `--model` name resolution — goes
-/// through here, so the override applies uniformly.
+/// Precedence: `--models-dir` (via `set_models_dir_override`) → `NEBULA_MODELS_DIR`
+/// → the platform default. Everything that looks for a model — download,
+/// auto-detect, `--model` name resolution — goes through here, so the override
+/// applies uniformly, including in the isolated LLM pre-flight child.
 pub fn models_dir() -> PathBuf {
+    if let Some(p) = MODELS_DIR_OVERRIDE.get() {
+        return p.clone();
+    }
     if let Ok(dir) = std::env::var("NEBULA_MODELS_DIR") {
         if !dir.trim().is_empty() {
             return PathBuf::from(dir.trim());

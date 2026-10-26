@@ -7,14 +7,39 @@
 //   Audit   — log only, never act
 //
 // All firewall calls go through src/firewall/mod.rs which detects
-// nftables / firewalld / ufw / iptables / /proc at startup.
+// nftables / firewalld / ufw / iptables / /proc on Unix and selects the
+// Windows Firewall (netsh advfirewall) backend on Windows.
 // If no firewall tool exists, errors are surfaced explicitly.
+//
+// PLATFORM: every action here works on Linux, Windows and macOS. Process
+// termination uses the native tool for the OS (`kill -9` vs `taskkill /F /T`),
+// and every state file (quarantine dir, isolation marker, block log) is resolved
+// through `platform::data_dir()` rather than a hardcoded /var/lib/nebula, which
+// on Windows put the agent's state at a path that does not exist.
 
 use crate::config::{ResponseConfig, AgentMode};
 use crate::firewall::Firewall;
 use crate::types::{ThreatEvent, RawEvent, ResponseAction};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn, error};
+
+// ── Platform-resolved state locations ─────────────────────────
+// data_dir() is /var/lib/nebula on Linux, C:\ProgramData\NebulaSentinel on
+// Windows, /Library/Application Support/NebulaSentinel on macOS.
+
+fn quarantine_dir() -> PathBuf { crate::platform::data_dir().join("quarantine") }
+fn isolation_marker() -> PathBuf { crate::platform::data_dir().join("ISOLATED") }
+fn blocked_ip_log() -> PathBuf { crate::platform::data_dir().join("blocked_ips.log") }
+
+/// PIDs that must never be killed. On Unix that is init (1); on Windows it is
+/// the System Idle Process (0) and System (4) — terminating either bugchecks
+/// the machine.
+fn is_protected_pid(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    { pid == 0 || pid == 4 }
+    #[cfg(not(target_os = "windows"))]
+    { pid <= 1 }
+}
 
 #[derive(Clone)]
 pub struct ResponseEngine {
@@ -66,14 +91,33 @@ impl ResponseEngine {
     }
 
     pub async fn kill_process(&self, pid: u32) {
-        if pid <= 1 {
-            warn!("  KillProcess: refusing pid={}", pid); return;
+        if is_protected_pid(pid) {
+            warn!("  KillProcess: refusing pid={} (protected system process)", pid); return;
         }
         warn!("⚡ [PROTECT] KILL pid={}", pid);
-        match tokio::process::Command::new("kill").args(["-9", &pid.to_string()]).output().await {
+
+        // taskkill /F = force, /T = terminate the child tree too (malware on
+        // Windows habitually re-spawns from a helper, so killing the tree is the
+        // behaviour that actually contains it). On Unix, SIGKILL the pid.
+        #[cfg(target_os = "windows")]
+        let cmd = tokio::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output().await;
+        #[cfg(not(target_os = "windows"))]
+        let cmd = tokio::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output().await;
+
+        match cmd {
             Ok(o) if o.status.success() => warn!("  ✅ pid={} killed", pid),
             Ok(o) => {
-                warn!("  ⚠️  kill pid={}: {}", pid, String::from_utf8_lossy(&o.stderr).trim());
+                let err = String::from_utf8_lossy(&o.stderr);
+                let err = if err.trim().is_empty() { String::from_utf8_lossy(&o.stdout).trim().to_string() }
+                          else { err.trim().to_string() };
+                warn!("  ⚠️  kill pid={}: {}", pid, err);
+                // Linux last resort: make the kernel OOM-killer pick this process
+                // first. No Windows equivalent, so it is Linux-gated.
+                #[cfg(target_os = "linux")]
                 let _ = std::fs::write(format!("/proc/{}/oom_score_adj", pid), "1000");
             }
             Err(e) => { error!("  ✗ kill failed: {}", e); }
@@ -82,21 +126,28 @@ impl ResponseEngine {
 
     pub async fn quarantine_file(&self, path: &str) {
         if !Path::new(path).exists() { warn!("  QuarantineFile: {} not found", path); return; }
-        let qdir = "/var/lib/nebula/quarantine";
-        let _ = std::fs::create_dir_all(qdir);
-        let safe_name = path.replace('/', "_").replace("..", "__");
-        let dest = format!("{}/{}.quarantine", qdir, safe_name);
+        let qdir = quarantine_dir();
+        let _ = std::fs::create_dir_all(&qdir);
+        // Flatten the source path into a single filename. Both separators are
+        // replaced (a Windows path is C:\Users\… ) and the drive colon too,
+        // since ':' is not legal in an NTFS filename and would make the rename
+        // fail silently on every Windows quarantine.
+        let safe_name = path
+            .replace(['/', '\\'], "_")
+            .replace(':', "_")
+            .replace("..", "__");
+        let dest = qdir.join(format!("{}.quarantine", safe_name));
         let result = std::fs::rename(path, &dest).or_else(|_| {
             std::fs::copy(path, &dest).map(|_| ())?;
             std::fs::remove_file(path)
         });
         match result {
-            Ok(_)  => warn!("📦 [PROTECT] Quarantined {} → {}", path, dest),
+            Ok(_)  => warn!("📦 [PROTECT] Quarantined {} → {}", path, dest.display()),
             Err(e) => error!("  ✗ Quarantine failed {}: {}", path, e),
         }
         let entry = format!("{} QUARANTINED: {}\n", chrono::Utc::now().to_rfc3339(), path);
         let _ = std::fs::OpenOptions::new().append(true).create(true)
-            .open(format!("{}/MANIFEST.log", qdir))
+            .open(qdir.join("MANIFEST.log"))
             .and_then(|mut f| { use std::io::Write; f.write_all(entry.as_bytes()) });
     }
 
@@ -105,7 +156,7 @@ impl ResponseEngine {
             Ok(_) => {
                 let entry = format!("{} BLOCKED: {}\n", chrono::Utc::now().to_rfc3339(), ip);
                 let _ = std::fs::OpenOptions::new().append(true).create(true)
-                    .open("/var/lib/nebula/blocked_ips.log")
+                    .open(blocked_ip_log())
                     .and_then(|mut f| { use std::io::Write; f.write_all(entry.as_bytes()) });
             }
             Err(e) => error!("  ✗ block_ip {} failed (backend={}): {}", ip, self.firewall.backend, e),
@@ -123,7 +174,8 @@ impl ResponseEngine {
         if self.is_isolated() { info!("  Already isolated"); return; }
         match self.firewall.isolate(&self.config.isolation_allowlist).await {
             Ok(_) => {
-                let _ = std::fs::write("/var/lib/nebula/ISOLATED", format!(
+                let _ = std::fs::create_dir_all(crate::platform::data_dir());
+                let _ = std::fs::write(isolation_marker(), format!(
                     "ISOLATED at {}\nBackend: {}\nAllowlist: {:?}\n",
                     chrono::Utc::now().to_rfc3339(), self.firewall.backend,
                     self.config.isolation_allowlist));
@@ -135,12 +187,12 @@ impl ResponseEngine {
     pub async fn undo_isolation(&self) {
         warn!("🔓 [PROTECT] Removing isolation...");
         match self.firewall.undo_isolation().await {
-            Ok(_) => { let _ = std::fs::remove_file("/var/lib/nebula/ISOLATED"); }
+            Ok(_) => { let _ = std::fs::remove_file(isolation_marker()); }
             Err(e) => error!("  ✗ Undo isolation failed: {}", e),
         }
     }
 
     pub fn is_isolated(&self) -> bool {
-        Path::new("/var/lib/nebula/ISOLATED").exists()
+        isolation_marker().exists()
     }
 }

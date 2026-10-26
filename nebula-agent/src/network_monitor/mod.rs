@@ -67,7 +67,8 @@ impl NetworkMonitor {
 
         // Connection tracker — polls /proc/net/tcp every 10s
         self.start_connection_tracker();
-        // DNS analysis — watches /var/log/syslog for named/systemd-resolved events
+        // DNS analysis — systemd-resolved/syslog on Linux, the DNS-Client
+        // operational channel or the resolver cache on Windows.
         self.start_dns_monitor();
         // Cloud metadata monitor — watches for 169.254.169.254 access
         self.start_metadata_monitor();
@@ -333,6 +334,67 @@ fn parse_hex_addr(hex: &str) -> Option<(String, u16)> {
     }
 }
 
+/// Recently-resolved domains, used by the DNS tunneling / DGA heuristics.
+///
+/// Windows has no syslog and no journal, so both Linux sources below return
+/// nothing there — which silently disabled DNS tunneling (T1071.004) and
+/// DGA/fast-flux (T1568.002) detection on every Windows agent. Two sources are
+/// used instead, in order of fidelity:
+///
+///   1. `Microsoft-Windows-DNS-Client/Operational` event 3006 — the actual
+///      query stream, but the channel is DISABLED by default. Operators who
+///      want full DNS visibility should enable it:
+///        wevtutil sl Microsoft-Windows-DNS-Client/Operational /e:true
+///   2. `Get-DnsClientCache` — the resolver cache. Always available with no
+///      configuration, and it holds what was recently resolved, which is
+///      sufficient for the entropy/subdomain-count heuristics. Entries persist
+///      for their TTL, so a domain can be seen on more than one poll; the
+///      callers treat repeats as harmless.
+#[cfg(target_os = "windows")]
+fn read_recent_dns_queries() -> Vec<String> {
+    let mut domains = vec![];
+
+    // 1. The DNS client operational channel, when the operator has enabled it.
+    if let Ok(out) = std::process::Command::new("wevtutil")
+        .args(["qe", "Microsoft-Windows-DNS-Client/Operational",
+               "/q:*[System[(EventID=3006)]]", "/c:200", "/rd:true", "/f:text"])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if let Some(d) = extract_domain_from_log(line) { domains.push(d); }
+            }
+        }
+    }
+
+    // 2. Resolver cache — always available.
+    if domains.is_empty() {
+        if let Ok(out) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                   "Get-DnsClientCache | Select-Object -ExpandProperty Entry"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let d = line.trim().trim_end_matches('.');
+                // Skip the header/underline rows PowerShell emits and anything
+                // that is not plausibly a hostname.
+                if d.len() > 3 && d.contains('.') && !d.starts_with('-')
+                    && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+                {
+                    domains.push(d.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
+    domains.sort();
+    domains.dedup();
+    domains
+}
+
+#[cfg(not(target_os = "windows"))]
 fn read_recent_dns_queries() -> Vec<String> {
     // Try systemd-resolved journal
     let mut domains = vec![];

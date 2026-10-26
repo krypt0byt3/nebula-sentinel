@@ -42,6 +42,7 @@ mod firewall;
 mod ransomware;
 mod dedup;
 mod suppression;
+mod atc_selftest;
 
 use anyhow::Result;
 use clap::Parser;
@@ -118,6 +119,22 @@ struct Args {
     /// process dies. The agent also runs this automatically as a pre-flight.
     #[arg(long)]
     llm_selftest: bool,
+
+    /// Run the FULL ATC path end-to-end against synthetic detections and exit.
+    ///
+    /// Unlike --llm-selftest (which only loads the model), this drives real
+    /// ThreatEvent values through LLMEngine::analyze_threat exactly as the agent
+    /// does in production, then scores the results: completion rate, verdict
+    /// accuracy against known ground truth, recall vs. specificity, and latency.
+    ///
+    /// The scenario set deliberately mixes true positives with benign lookalikes,
+    /// so a model that simply answers "malicious" every time scores poorly.
+    #[arg(long)]
+    atc_test: bool,
+
+    /// With --atc-test: run only the named scenario (e.g. "cred-dump").
+    #[arg(long, value_name = "KEY")]
+    atc_scenario: Option<String>,
 }
 
 #[tokio::main]
@@ -138,6 +155,9 @@ async fn main() -> Result<()> {
     // resolution — and child processes (the LLM pre-flight) inherit it.
     if let Some(ref dir) = args.models_dir {
         if !dir.trim().is_empty() {
+            // Process-wide override so every lookup path agrees …
+            platform::set_models_dir_override(dir.trim());
+            // … and export it so the isolated LLM pre-flight child inherits it.
             std::env::set_var("NEBULA_MODELS_DIR", dir.trim());
         }
     }
@@ -165,6 +185,36 @@ async fn main() -> Result<()> {
             eprintln!("LLM_SELFTEST_FAIL: model did not load");
             std::process::exit(1);
         }
+    }
+    // End-to-end ATC check: load the backend AND drive real detections through
+    // analyze_threat, scoring discrimination (true positives vs. benign
+    // lookalikes), then exit. This is the check that proves a model is usable
+    // as the agent's brain, not merely loadable.
+    if args.atc_test {
+        let mut cfg = AgentConfig::load(&args.config)
+            .or_else(|_| AgentConfig::load("config.toml"))
+            .map_err(|e| anyhow::anyhow!("config load failed: {}", e))?;
+        if let Some(ref m) = args.model {
+            cfg.llm.model_path = Some(m.clone());
+        }
+        let engine = llm::LLMEngine::new(cfg.llm.clone()).await;
+        if !engine.is_available().await {
+            eprintln!("ATC_TEST_FAIL: no backend loaded");
+            std::process::exit(1);
+        }
+        println!("backend      : {}", engine.backend_name());
+        println!("max_context  : {}", cfg.llm.max_context_tokens);
+
+        let outcomes = atc_selftest::run(&engine, args.atc_scenario.as_deref()).await;
+        atc_selftest::report(&outcomes);
+
+        let produced = outcomes.iter().filter(|o| o.completed()).count();
+        if produced == 0 {
+            eprintln!("ATC_TEST_FAIL: no scenario produced an analysis");
+            std::process::exit(1);
+        }
+        println!("\nATC_TEST_DONE");
+        std::process::exit(0);
     }
     if args.list_models {
         llm::print_model_catalog();
