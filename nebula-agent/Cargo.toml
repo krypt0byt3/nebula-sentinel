@@ -1,0 +1,294 @@
+[package]
+name = "nebula-agent"
+version = "2.0.0"
+edition = "2021"
+authors = ["NebulaSentinel"]
+description = "NebulaSentinel Autonomous Threat Cognition Agent"
+license = "AGPL-3.0-or-later"
+build = "build.rs"
+
+[[bin]]
+# Binary name is platform-stamped at build time.
+# Build scripts produce: nebula-agent-linux-x86_64, nebula-agent-windows-x86_64.exe, nebula-agent-macos-aarch64
+# Use: cargo build --bin nebula-agent
+# CI: see scripts/build-all-platforms.sh
+name = "nebula-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Shared GOSSIP protocol crate — the single source of truth for the ecosystem
+# envelope, ATC event types, dedup, and signing. Path dep (crates are not yet a
+# Cargo workspace; this keeps them decoupled while sharing the wire format).
+nebula-gossip = { path = "../nebula-gossip" }
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+
+# HTTP client (Nexus communication — still needed for Nexus API, not LLM)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Crypto / TLS
+rustls = "0.23"
+# AES-256-GCM AEAD for forensic-artifact encryption. Already in the dependency
+# graph via rustls/reqwest, so declaring it directly pulls no new crate.
+ring = "0.17"
+sha2 = "0.10"
+sha1 = "0.10"
+md5 = "0.7"
+hmac = "0.12"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# System info
+sysinfo = "0.32"
+libc = "0.2"
+nix = { version = "0.29", features = ["process", "fs", "user", "signal", "ptrace"], optional = true }
+
+# Network
+pnet = { version = "0.35", optional = true }
+
+# eBPF — aya, the pure-Rust BPF loader (no libbpf C dependency for userspace).
+# Optional: pulled in only by the `ebpf` feature. We load a precompiled CO-RE
+# object (bpf/nebula.bpf.o); aya handles map/program loading, attach, and the
+# ring buffer. Pinned to a 0.13.x line (current stable aya API used in
+# collector/ebpf.rs: Ebpf::load/load_file, programs::{TracePoint,KProbe},
+# maps::RingBuf). If you bump aya major, re-check those call sites.
+aya = { version = "0.13", optional = true }
+
+# YARA — pure-Rust engine (yara-x, by the original YARA author / VirusTotal).
+# NO external C library, NO libyara-dev, NO system dependency — compiles from
+# source and statically links into the binary like any other Rust crate.
+# Upgraded 0.13 → 1: yara-x 0.13 pulled wasmtime 29.0.1, which carries two
+# CRITICAL (9.0) sandbox-escape advisories (RUSTSEC-2026-0095/0096) + mediums.
+# yara-x 1.x pulls a current, patched wasmtime. This is a MAJOR bump; the
+# Compiler/Scanner/MetaValue calls in yara_scan/mod.rs may need small updates —
+# verify on build (see SECURITY note in BUILD docs).
+yara-x = { version = "1", optional = true }
+
+# Regex
+regex = "1"
+fancy-regex = "0.14"
+
+# File system watching
+notify = "6"
+
+# Process execution
+which = "6"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+# `time` pinned EXACTLY to 0.3.47 to fix RUSTSEC-2026-0009 (DoS via stack
+# exhaustion in RFC 2822 parsing). Kept exact (not a range) so Cargo cannot
+# float into a newer `time` whose trait impls re-trigger the E0119 build
+# conflict we hit originally. If `cargo audit` later flags 0.3.47, bump this to
+# the next advisory-clean release and rebuild to confirm no E0119 returns.
+time = "=0.3.47"
+
+# HTTP framework (status UI server on localhost:7443)
+axum = { version = "0.7", features = ["tokio"] }
+tower = "0.4"
+
+# Async channels
+tokio-stream = "0.1"
+async-channel = "2"
+dashmap = "6"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Config
+dirs = "5"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Compression
+flate2 = "1"
+zstd = "0.13"
+
+# Syslog (legacy mode) — Unix-only: the `syslog` crate v7 does not compile on
+# Windows (it references io::ErrorKind without importing it on the non-unix path).
+# It's declared under [target.'cfg(unix)'.dependencies] below. Our legacy bridge
+# formats syslog/CEF/LEEF itself and sends over plain UDP/TCP, so this crate is
+# only needed for an optional local-syslog-socket path on Unix.
+
+# Parallel processing
+rayon = "1"
+
+# Container security (bollard = Docker API, optional for container monitoring)
+# bollard = { version = "0.17", optional = true }
+
+# Semver for version comparison in vulnerability scanning
+semver = "1"
+
+# Structured data
+indexmap = { version = "2", features = ["serde"] }
+
+# PCAP
+pcap = { version = "2", optional = true }
+
+# Memory forensics
+memmap2 = { version = "0.9", optional = true }
+
+# ── Embedded LLM (llama.cpp via Rust bindings) ─────────────────
+# Feature "embedded-llm" compiles llama.cpp as part of the agent.
+# No external runtime (Ollama, Python, etc.) required.
+# The model GGUF file is loaded from disk at runtime (not embedded in binary).
+#
+# GPU acceleration is auto-detected by llama.cpp's own build system via
+# build.rs environment variables — it does NOT use Cargo feature flags:
+#   CUDA   → set LLAMA_CUDA=1 (or GGML_CUDA=1) before building
+#   Metal  → automatic on macOS Apple Silicon
+#   ROCm   → set LLAMA_HIPBLAS=1 before building
+#   CPU    → default fallback (AVX/AVX2 auto-detected)
+#
+# To build without LLM (saves ~200MB binary, no C++ toolchain needed):
+#   cargo build --release --no-default-features --features "ebpf-stub,inventory,gossip"
+#
+# To build with embedded LLM:
+#   cargo build --release   (default — requires C++ toolchain)
+#
+# Uses llama-cpp-2 (actively maintained, tracks upstream llama.cpp closely) so
+# modern architectures — Phi-3, Qwen2.5, Llama-3, Gemma, etc. — load correctly.
+# The old `llama_cpp` 0.1 crate vendored a pre-Phi-3 llama.cpp and could not
+# load current GGUF models ("unknown model architecture: 'phi3'").
+llama-cpp-2 = { version = "0.1", optional = true }
+
+# Candle (pure-Rust fallback — no C FFI, but slower than llama.cpp)
+# Use only if llama.cpp won't compile in your environment.
+# candle-core       = { version = "0.6", optional = true }
+# candle-nn         = { version = "0.6", optional = true }
+# candle-transformers = { version = "0.6", optional = true }
+# hf-hub            = { version = "0.3", optional = true, features = ["tokio"] }
+# tokenizers        = { version = "0.15", optional = true }
+
+# ── Windows-specific dependencies ────────────────────────────────────────
+[target.'cfg(target_os = "windows")'.dependencies]
+# winapi for Windows Event Log, registry, process snapshot
+winapi = { version = "0.3", features = ["tlhelp32","processthreadsapi","winbase","winerror","winsvc","evntrace","winevt"], optional = true }
+
+# ── macOS-specific dependencies ───────────────────────────────────────────
+[target.'cfg(target_os = "macos")'.dependencies]
+# Security framework for keychain, code signing
+security-framework = { version = "2", optional = true }
+# System Configuration framework for network state
+system-configuration = { version = "0.5", optional = true }
+
+# ── Unix-only dependencies ────────────────────────────────────────────────
+[target.'cfg(unix)'.dependencies]
+# syslog crate is Unix-only (does not compile on Windows). Used for the optional
+# local-syslog-socket path of the legacy bridge.
+syslog = "7"
+
+[features]
+# Default build: embedded llama.cpp (like the Nexus — local inference, no Ollama,
+# no external runtime or server process). Requires a C++ toolchain to compile
+# llama.cpp from source. This is the recommended, self-contained configuration.
+default        = ["ebpf-stub", "inventory", "gossip", "embedded-llm"]
+ebpf-stub      = []
+gossip         = []
+inventory      = []
+
+# embedded-llm: compile llama.cpp into the agent (requires C++ toolchain).
+# This is ON by default. GPU backend is controlled by environment variables at
+# build time, not Cargo features:
+#   CUDA:  LLAMA_CUDA=1 cargo build --release --features embedded-llm
+#   ROCm:  LLAMA_HIPBLAS=1 cargo build --release --features embedded-llm
+#   Metal: automatic on macOS (no env var needed)
+#   CPU:   default (no env var needed)
+# To build WITHOUT a C++ toolchain (no local LLM): --no-default-features --features ebpf-stub,inventory,gossip
+embedded-llm   = ["llama-cpp-2"]
+
+# ── CPU target baseline ──────────────────────────────────────────────────
+# IMPORTANT: the CPU SIMD baseline is chosen by llama-cpp-sys-2 from Rust's
+# target features (CARGO_CFG_TARGET_FEATURE), NOT by a Cargo feature. So these
+# feature names are just embedded-llm aliases — they do NOT by themselves change
+# the SIMD baseline (a previous build.rs tried to, but it ran too late to matter).
+#
+#   DEFAULT (no flags)  → portable SSE2 baseline + GGML_NATIVE=OFF. Runs on ANY
+#                         x86-64, including AVX-less QEMU VMs. No SIGILL. Use this
+#                         for CPU agents / mixed fleets. This is what you want.
+#   AVX2 (fast, opt-in) → build with RUSTFLAGS so llama.cpp turns on AVX2/FMA:
+#                           RUSTFLAGS="-C target-feature=+avx2,+fma,+f16c" \
+#                             cargo build --release
+#                         ~2-4x faster CPU inference, but SIGILLs on non-AVX2 CPUs.
+#
+# The cpu-portable/cpu-avx2/legacy_cpu/modern_cpu names are kept for build-script
+# and doc compatibility; all just enable embedded-llm. Baseline = RUSTFLAGS.
+cpu-portable   = ["embedded-llm"]
+cpu-avx2       = ["embedded-llm"]
+legacy_cpu     = ["cpu-portable"]
+modern_cpu     = ["cpu-avx2"]
+
+# ── cuda: NVIDIA GPU acceleration for the embedded LLM ───────────────────
+# Enables the llama-cpp-2 `cuda` backend so the model runs on the GPU. Build:
+#   cargo build --release --features cuda
+# (cuda implies embedded-llm). Requires on the BUILD host: CUDA toolkit + nvcc
+# on PATH and CUDA_PATH/CUDA_HOME set. Requires at RUNTIME: NVIDIA driver +
+# libcudart/libcublas. When this feature is on you'll see the build print
+# "NVIDIA CUDA backend ENABLED" — if you instead see "CPU build", the feature
+# didn't take. Keep compute_mode="auto" and gpu_layers=-1 in config.toml.
+cuda           = ["embedded-llm", "llama-cpp-2/cuda"]
+
+# ── GPU acceleration for the embedded LLM (ADVANCED, opt-in) ──
+# The default build is CPU-only and fully self-contained (static llama.cpp,
+# needs only glibc) — it runs on ANY host. GPU acceleration requires building
+# llama-cpp-2 with its backend feature AND shipping to hosts that have the
+# matching GPU runtime installed (CUDA driver+libcudart, ROCm, or Vulkan loader).
+#
+# To build a GPU agent, enable the backend on the llama-cpp-2 dependency, e.g.:
+#   cargo build --release --features yara \
+#     --config 'dependencies.llama-cpp-2.features=["cuda"]'
+# (or add `features = ["cuda"]` to the llama-cpp-2 line below for a GPU-only fleet).
+#
+# ⚠ Do NOT build deployment binaries with --all-features: it force-enables the
+#   CUDA backend and pulls libpcap, producing a binary that fails to start on
+#   any host without the CUDA runtime and libpcap installed.
+
+# yara: real YARA engine via pure-Rust yara-x (NO external C library needed).
+# Build with:  cargo build --release --features yara
+yara           = ["yara-x"]
+
+# ebpf: REAL kernel-level syscall monitoring via aya (pure-Rust BPF loader).
+# Pulls in the `aya` crate and compiles src/collector/ebpf.rs. You ALSO need the
+# compiled CO-RE object bpf/nebula.bpf.o present at runtime (see bpf/README.md
+# for the one-line clang build). Requires Linux 5.8+ with BTF and CAP_BPF/root.
+# Build with:  cargo build --release --features ebpf,yara
+# Without this feature the agent still builds and the "ebpf" backend cleanly
+# falls back to procmon (5s /proc polling) at runtime.
+ebpf           = ["aya"]
+
+# full-linux: optional kernel-level features (requires libpcap-dev for pcap).
+# NOTE: YARA is NOT here anymore — it's its own pure-Rust feature above.
+full-linux     = ["nix", "pnet", "pcap", "memmap2", "yara"]
+
+[build-dependencies]
+# build.rs uses this to detect GPU toolchain at compile time
+cc = "1"
+
+# NOTE: [profile.*] are defined once at the workspace root (../Cargo.toml).
+# Cargo ignores profile sections declared in a workspace member, so they live
+# there, not here.
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = [
+    'cfg(llm_backend, values("cuda", "rocm", "metal", "cpu", "vulkan"))',
+    'cfg(has_blas)',
+    'cfg(has_avx2)',
+    'cfg(has_avx512)',
+] }

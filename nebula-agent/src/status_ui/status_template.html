@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>NebulaSentinel — {hostname}</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;background:#05080d;color:#dae8ff;font-size:13px;line-height:1.5;padding:24px;max-width:980px;margin:0 auto;-webkit-font-smoothing:antialiased}
+.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:14px;border-bottom:1px solid rgba(44,80,160,.2)}
+.brand{display:flex;align-items:center;gap:10px}
+.icon{width:36px;height:36px;background:rgba(0,207,255,.12);border:1px solid rgba(0,207,255,.3);border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.bname{font-size:15px;font-weight:700;background:linear-gradient(135deg,#00cfff,#7b8fff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:18px}
+.kpi{background:#0d1520;border:1px solid rgba(44,80,160,.18);border-radius:9px;padding:12px 14px}
+.kv{font-size:22px;font-weight:700;line-height:1;margin-bottom:4px}
+.kl{font-size:9px;color:#4a6080;text-transform:uppercase;letter-spacing:.1em}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.card{background:#0d1520;border:1px solid rgba(44,80,160,.18);border-radius:9px;padding:14px 16px}
+.ct{font-size:11.5px;font-weight:600;color:#00cfff;margin-bottom:10px}
+.row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.row:last-child{border:none}
+.rk{font-size:10.5px;color:#4a6080}.rv{font-size:11px;font-weight:500;font-family:monospace}
+.note{font-size:10px;color:#4a6080;text-align:center;margin-top:16px}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div class="brand">
+    <div class="icon">🛡</div>
+    <div><div class="bname">NebulaSentinel</div><div style="font-size:10px;color:#4a6080">{hostname} · {platform} · {version}</div></div>
+  </div>
+  <div style="font-size:10px;color:#4a6080">Auto-refresh 15s · <a href="/api/status" style="color:#00cfff">JSON API</a></div>
+</div>
+<div class="kpis">
+  <div class="kpi"><div class="kv" style="color:{mode_color}">{mode}</div><div class="kl">Mode</div></div>
+  <div class="kpi"><div class="kv" style="color:{posture_color}">{posture:.0}%</div><div class="kl">Posture</div></div>
+  <div class="kpi"><div class="kv" style="color:{nexus_color}">{nexus_status}</div><div class="kl">Nexus</div></div>
+  <div class="kpi"><div class="kv" style="color:{threat_color}">{threats}</div><div class="kl">Active Threats</div></div>
+  <div class="kpi"><div class="kv" style="color:#00cfff">{rules}</div><div class="kl">Rules</div></div>
+</div>
+<div class="g2">
+  <div class="card">
+    <div class="ct">System</div>
+    <div class="row"><span class="rk">Agent ID</span><span class="rv" style="color:#00cfff;font-size:10px">{agent_id}</span></div>
+    <div class="row"><span class="rk">Nexus URL</span><span class="rv" style="font-size:10px">{nexus_url}</span></div>
+    <div class="row"><span class="rk">Last contact</span><span class="rv">{last_contact}</span></div>
+    <div class="row"><span class="rk">Firewall</span><span class="rv">{firewall}</span></div>
+    <div class="row"><span class="rk">LLM</span><span class="rv">{llm}</span></div>
+    <div class="row"><span class="rk">IOCs</span><span class="rv">{iocs}</span></div>
+    <div class="row"><span class="rk">Started</span><span class="rv" style="font-size:10px">{started}</span></div>
+  </div>
+  <div class="card"><div class="ct">Modules</div>{modules_html}</div>
+</div>
+<div class="card"><div class="ct">Recent Events</div>{threats_html}</div>
+<div class="note">NebulaSentinel Status UI · Read-only · 127.0.0.1:7440 only · Not network-accessible</div>
+</body>
+</html>

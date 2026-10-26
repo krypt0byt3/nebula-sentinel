@@ -1,0 +1,32 @@
+[package]
+name = "nebula-gossip"
+version = "0.1.0"
+edition = "2021"
+description = "Shared GOSSIP protocol envelope, ATC event types, dedup, and signing for the NebulaSentinel ecosystem."
+license = "AGPL-3.0-or-later"
+
+# This crate is the single source of truth for the GOSSIP wire format. Every
+# ecosystem component (nebula-agent, nexus-server, cortex, dopamine, red-nebula,
+# synapse) depends on THIS so they all speak byte-identical envelopes.
+#
+# Both the agent and the Nexus pull it in via a path dependency:
+#   nebula-gossip = { path = "../nebula-gossip" }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+# Pure-Rust ed25519 signing — works identically on agent and Nexus with no C
+# dependency. `rand_core` for keypair generation. We keep crypto optional behind
+# a default-on `signing` feature so a build that only needs the types (e.g. a
+# parser) can drop the crypto deps.
+ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
+rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
+
+[features]
+default = ["signing"]
+# signing: enables envelope sign/verify + keypair generation (ed25519-dalek).
+signing = ["ed25519-dalek", "rand_core"]

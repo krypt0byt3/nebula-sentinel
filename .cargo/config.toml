@@ -1,0 +1,65 @@
+# Workaround for "HTTP2 framing layer" errors when fetching from crates.io.
+# Forces cargo to use the git CLI and the sparse registry protocol, which
+# avoids the libcurl HTTP/2 multiplexing path that fails on some networks.
+
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+git-fetch-with-cli = true
+retry = 5
+
+[http]
+multiplexing = false
+
+# ── Portable embedded-LLM build (prevents "Illegal instruction" / SIGILL) ──
+# llama.cpp's CMake defaults to GGML_NATIVE=ON (-march=native), baking in the
+# BUILD machine's SIMD. Running that on a CPU without those instructions traps
+# with "invalid opcode" / SIGILL — and it fires specifically when the LLM runs,
+# since that's the only AVX-heavy code path.
+#
+# IMPORTANT BASELINE CHOICE:
+# The default QEMU/KVM CPU model ("QEMU Virtual CPU version 2.5+") exposes only
+# SSE..SSE4.2 — NO AVX, AVX2, or FMA. Forcing AVX2 ON makes the agent SIGILL on
+# such VMs. We therefore target an SSE4.2 baseline, which runs on virtually any
+# x86-64 CPU (bare metal or VM) built since ~2008.
+#
+#   GGML_NATIVE=OFF  — do not target the build CPU
+#   AVX/AVX2/FMA OFF — avoid instructions missing on default QEMU CPUs
+#   SSE4.2 is implied by the x86-64 baseline llama.cpp uses when AVX is off
+#
+# PERFORMANCE NOTE: SSE-only inference is slower than AVX2. If your ENTIRE fleet
+# (including VMs) runs on host-passthrough CPUs with AVX2, you can flip
+# GGML_AVX2=ON (and GGML_FMA=ON) for a big speedup — but the binary will then
+# SIGILL on any CPU/VM without AVX2. For mixed fleets, keep the SSE baseline,
+# or give VMs a host-passthrough CPU model (e.g. libvirt <cpu mode="host-passthrough">).
+
+# ── CUDA static-runtime link path (reaches ALL crates, incl. llama-cpp-sys-2) ──
+# The GPU build links `cudart_static`, requested by llama-cpp-sys-2's OWN build
+# script. cargo:rustc-link-search from nebula-agent's build.rs does NOT propagate
+# to a dependency's link step — only a GLOBAL linker search path does. rustflags
+# here apply to every crate's linking, so this is what actually lets
+# llama-cpp-sys-2 find libcudart_static.a.
+#
+# On this system the static lib is at /usr/lib/x86_64-linux-gnu (distro-package
+# CUDA layout). If `find /usr /opt -name libcudart_static.a` shows a different
+# dir, adjust below. Unused -L paths are harmless for CPU-only builds.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "native=/usr/lib/x86_64-linux-gnu", "-L", "native=/usr/local/cuda/lib64"]
+
+# ── CPU SIMD baseline is controlled by Rust target features ───────────────
+# The embedded llama.cpp SIMD baseline is set by llama-cpp-sys-2 from Rust's
+# target features (CARGO_CFG_TARGET_FEATURE), which its build script reads. The
+# DEFAULT x86-64 target = SSE2 + GGML_NATIVE=OFF → a portable binary that is
+# SIGILL-safe on AVX-less QEMU VMs. No env/flags needed for the safe CPU build.
+#
+# Do NOT try to force the baseline from nebula-agent/build.rs via env::set_var —
+# that script runs AFTER the llama.cpp compile, so it has no effect (this is why
+# the old CMAKE_ARGS/CFLAGS approach here and in build.rs was removed).
+#
+# To build a FASTER (but non-portable) AVX2 binary, raise the target features:
+#   RUSTFLAGS="-C target-feature=+avx2,+fma,+f16c" cargo build --release
+# You could instead pin it here for the whole workspace, e.g.:
+#   [build]
+#   rustflags = ["-C", "target-feature=+avx2,+fma,+f16c"]
+# (omit that to keep the portable default).

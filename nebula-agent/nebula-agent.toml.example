@@ -1,0 +1,325 @@
+# ====================================================================
+#  TEMPLATE — copy this to 'config.toml' and edit before first run:
+#      cp nebula-agent.toml.example config.toml
+#  Then review every CHANGE_ME value, path, and port below.
+# ====================================================================
+
+# ============================================================
+# NebulaSentinel Agent — config.toml
+# ============================================================
+
+hostname = "agent-prod-01"          # Override per machine
+agent_id  = ""                       # Auto-assigned by Nexus on first registration
+mode      = "detect"                 # "detect" | "protect" | "audit"
+
+# ── Nexus connectivity ──────────────────────────────────────
+[nexus]
+enabled               = true
+# ATC port — the dedicated agent communication port on Nexus.
+# Agents MUST use the ATC port (default 9443), NOT the MGMT port (8443).
+# The MGMT port rejects agent API calls — it's for operator use only.
+url                   = "https://nexus.corp.local:9443"
+api_key               = "CHANGE_ME"
+report_interval_secs  = 30
+
+# ── Event buffering (optional queue-first delivery) ──────────────
+# Default: events send to Nexus immediately (lowest latency), and the local
+# SQLite queue is used AUTOMATICALLY as failover whenever Nexus is unreachable.
+# You already get durability (no loss during outages) without any delay.
+#
+# Set buffer_events_locally=true ONLY if you want EVERY event routed through
+# the local buffer and flushed in batches — useful for very high event volumes
+# or unreliable links, at the cost of up to one flush-interval of delay before
+# events appear on the Nexus.
+buffer_events_locally     = false
+# Flush interval (seconds) — only used when buffer_events_locally=true, and for
+# draining the failover queue after Nexus comes back.
+event_flush_interval_secs = 30
+
+# TLS: always enabled in production.
+# Copy Nexus cert: scp nexus:/var/lib/nexus/certs/nexus.crt /etc/nebula/certs/nexus-ca.pem
+tls_verify            = true
+ca_cert_path          = "/etc/nebula/certs/nexus-ca.pem"
+
+# ATC primary protocol (enriched events only — no raw log exfil)
+atc_mode              = true
+
+# mTLS client certificate (optional — matches require_agent_cert on Nexus)
+# agent_cert_path = "/etc/nebula/certs/agent.crt"
+# agent_key_path  = "/etc/nebula/certs/agent.key"
+
+# Legacy syslog bridge (optional)
+legacy_syslog_enabled = false
+legacy_syslog_host    = "siem.corp.local"
+legacy_syslog_port    = 514
+legacy_syslog_proto   = "udp"       # "udp" | "tcp" | "tls"
+
+# ── LLM (local — Microsoft Phi-3 via Ollama) ─────────────────
+[llm]
+enabled              = true
+mode                 = "local"       # "local" | "nexus_proxy" | "disabled"
+
+# ── Embedded model (preferred — no external dependencies) ─────
+# Which GGUF to load directly into the agent process. Accepts a full path, a
+# directory of models (newest wins), a filename in the models dir (with or
+# without ".gguf"), a catalog alias already downloaded, or a unique fragment of
+# a filename ("qwen").
+# Leave blank/unset to auto-select: the model recommended for the detected GPU
+# VRAM, else whatever GGUF was most recently downloaded into the models dir.
+# Per-run override (nothing written back to this file):
+#           nebula-agent --model <path|filename|alias|fragment>   (or NEBULA_MODEL=…)
+#           nebula-agent --models-dir <DIR>    (load models from somewhere else)
+# Download: nebula-agent --download-model            (recommended for this hardware)
+#           nebula-agent --list-models               (built-in aliases)
+#           nebula-agent --download-model <alias|owner/repo|owner/repo:file.gguf|url>
+#                                                    (any GGUF — see MODELS.md)
+# model_path = "/var/lib/nebula/models/phi3-mini-4k-instruct-q4_k_m.gguf"
+
+# ── Ollama fallback (used only if embedded model file is missing) ─
+ollama_url           = "http://localhost:11434"
+model                = "phi3:mini"   # used in CPU mode
+fallback_model       = "phi3:mini"
+confidence_threshold = 70
+max_context_tokens   = 4096
+
+# GPU / CPU compute mode
+# "auto"  probe at startup; use GPU if available, fall back to CPU (RECOMMENDED)
+# "gpu"   require GPU; abort if not found
+# "cpu"   force CPU inference even if GPU is present
+compute_mode         = "auto"
+
+# Transformer layers to offload to GPU VRAM.
+# -1 = Ollama decides automatically (best for most setups)
+#  0 = CPU only (same as compute_mode="cpu")
+#  N = offload N layers, run remainder on CPU (for low-VRAM GPUs)
+gpu_layers           = -1
+
+# Optional: pin the VRAM budget manually (MB) instead of auto-detecting.
+# Useful when multiple models share a GPU.
+# gpu_vram_mb        = 8192
+
+# Optional: use a stronger model when GPU is detected.
+# If absent, `model` is used on both CPU and GPU.
+# Recommendations by VRAM:
+#   4-8  GB VRAM → "phi3:medium"
+#   8-16 GB VRAM → "mistral:7b-instruct-q4_K_M"
+#   16+  GB VRAM → "mistral:7b-instruct-q8_0"
+# gpu_model_override = "phi3:medium"
+# Nebula Whisper identity
+system_prompt        = """You are Nebula Whisper, an expert cybersecurity analyst embedded in the NebulaSentinel agent.
+You have full access to this system's events, posture, vulnerabilities, and behavioral data.
+Reason step-by-step. Be concise. Produce detection rules when asked.
+Follow MITRE ATT&CK taxonomy. Always output JSON when generating signatures."""
+
+# ── Collector (event sources) ────────────────────────────────
+[collector]
+# On Linux: "ebpf" | "procmon" | "audit" | "simulated"
+backend              = "ebpf"
+# eBPF programs to load
+ebpf_programs        = ["execve", "open", "connect", "read", "write", "clone", "ptrace", "mmap"]
+# ETW on Windows (future)
+etw_enabled          = false
+# Kernel audit log fallback
+auditd_socket        = "/var/run/audispd_events"
+buffer_size          = 65536
+event_queue_depth    = 4096
+deduplicate_window_secs = 5
+
+# ── Anomaly detection ────────────────────────────────────────
+[anomaly]
+heuristic_enabled    = true
+ml_enabled           = false         # Future ONNX model
+baseline_window_days = 14
+chain_detection      = true          # MITRE ATT&CK chained attack detection
+chain_window_secs    = 300
+confidence_threshold = 60.0
+
+# MITRE ATT&CK chain patterns to watch
+# Format: ordered list of tactic/technique pairs
+[[anomaly.chain_patterns]]
+name   = "Web-to-Shell exploit chain"
+tactics = ["initial_access", "execution", "persistence"]
+techniques = ["T1190", "T1059.004", "T1053.003"]
+min_confidence = 80.0
+
+[[anomaly.chain_patterns]]
+name   = "Credential dump and lateral movement"
+tactics = ["credential_access", "lateral_movement"]
+techniques = ["T1003.001", "T1021.002"]
+min_confidence = 75.0
+
+[[anomaly.chain_patterns]]
+name   = "Download and execute dropper"
+tactics = ["execution", "defense_evasion"]
+techniques = ["T1105", "T1059", "T1027"]
+min_confidence = 70.0
+
+# ── Detection rules ──────────────────────────────────────────
+[rules]
+# Drop .yar/.yara files here for malware signature detection. With the `yara`
+# build feature (pure-Rust yara-x engine — NO libyara, NO C library, NO system
+# dependency), these are evaluated by the REAL YARA engine — string sets, hex
+# patterns, regex, and condition logic — applied to file scans (on-access +
+# periodic) AND process memory (fileless malware). Without the feature, a
+# lightweight string-matcher fallback is used.
+# Build with real YARA (no external deps):  cargo build --release --features yara
+yara_dir             = "/etc/nebula/rules/yara"
+sigma_dir            = "/etc/nebula/rules/sigma"
+wazuh_rules_dir      = "/etc/nebula/rules/wazuh"
+suricata_rules_dir   = "/etc/nebula/rules/suricata"
+snort_rules_dir      = "/etc/nebula/rules/snort"
+auto_reload          = true
+reload_interval_secs = 60
+# AI-generated rules require human approval on Nexus before deployment
+ai_rules_require_approval = true
+
+# ── Response engine ──────────────────────────────────────────
+[response]
+# In detect mode: log + notify only
+# In protect mode: auto-remediate below these thresholds
+auto_kill_threshold      = 95.0
+auto_quarantine_threshold = 90.0
+auto_isolate_threshold   = 85.0
+# Network isolation drops all traffic except Nexus and DNS
+isolation_allowlist = ["nexus.corp.local", "8.8.8.8"]
+rollback_enabled     = true
+snapshot_on_threat   = true
+
+# ── Forensics ────────────────────────────────────────────────
+[forensics]
+enabled              = true
+output_dir           = "/var/lib/nebula/forensics"
+# Minimum threat confidence (0-100) to trigger forensic capture. Raise this to
+# avoid collecting on legitimate-but-suspicious activity (e.g. an admin SSH +
+# sudo to root). Default 90 = only high-fidelity detections trigger capture.
+min_confidence       = 90.0
+# Capture forensics BEFORE a destructive response (kill/isolate/quarantine) so
+# volatile state (process memory, /proc, open FDs) is captured while the process
+# is still alive — avoids the race where the kill destroys the evidence.
+capture_before_response = true
+# What to capture on qualifying events
+memory_dump          = true
+pcap_on_event        = true
+pcap_duration_secs   = 60
+pcap_filter          = "not port 53"
+collect_logs         = true
+log_paths            = ["/var/log", "/home", "/tmp"]
+max_artifact_size_mb = 512
+encrypt_artifacts    = true
+
+# ── Inventory & file catalog ─────────────────────────────────
+[inventory]
+enabled              = true
+scan_interval_secs   = 3600
+hash_algorithm       = "sha256"     # "md5" | "sha1" | "sha256"
+# Paths to catalog
+include_paths        = ["/usr/bin", "/usr/sbin", "/bin", "/sbin", "/etc", "/lib"]
+exclude_paths        = ["/proc", "/sys", "/dev", "/run"]
+track_installed_pkgs = true
+track_processes      = true
+track_network_conns  = true
+track_users          = true
+track_containers     = true
+
+# ── Posture & compliance ─────────────────────────────────────
+[posture]
+oscal_enabled            = true
+oscal_catalog_path       = "/etc/nebula/oscal/catalog.json"
+cis_benchmark_path       = "/etc/nebula/cis/linux-benchmark.json"
+stig_content_path        = "/etc/nebula/stig/"
+nvd_feed_path            = "/var/lib/nebula/nvd/"
+oval_feed_path           = "/var/lib/nebula/oval/"
+scan_interval_secs       = 3600
+# Smart-scan: on startup, skip the expensive full scan (file-catalog walk) when
+# a recent full scan exists AND the installed-package set is unchanged. Avoids
+# redundant heavy work when the agent is reinstalled/restarted on an unchanged
+# host. State persists to /var/lib/nebula/scan_state.db.
+smart_scan               = true
+# Force a full scan if the last one is older than this many hours, even when the
+# host looks unchanged (catches drift the package fingerprint can't see).
+full_scan_max_age_hours  = 24
+dependency_scan_enabled  = true
+compliance_frameworks    = ["nist_csf", "cis_l2", "pci_dss", "soc2", "iso27001", "disa_stig"]
+# Package managers to scan
+pkg_managers             = ["dpkg", "rpm", "apk", "cargo", "pip", "npm", "gem"]
+
+# ── Hardening advisor ────────────────────────────────────────
+[hardening]
+enabled          = true
+auto_apply       = false            # Set true in protect mode (with care)
+frameworks       = ["cis_l2", "stig"]
+report_path      = "/var/lib/nebula/hardening/"
+sshd_hardening   = true
+kernel_hardening = true             # sysctl recommendations
+firewall_audit   = true
+
+# ── Retro-hunting ────────────────────────────────────────────
+[retro]
+enabled           = true
+on_new_rule       = true            # Auto-hunt when new rule deployed
+log_sources       = ["/var/log/auth.log", "/var/log/syslog", "/var/log/nginx/", "/var/log/apache2/"]
+evtx_paths        = []              # Windows event logs (future)
+max_lookback_days = 90
+parallel_threads  = 4
+
+# ── Offline queue (for roaming / disconnected agents) ──────────
+[offline_queue]
+enabled      = true
+db_path      = "/var/lib/nebula/offline_queue.db"
+# Maximum disk space for queued events (MB). Oldest events evicted when full.
+max_size_mb  = 500
+# Geo-annotate events with the public IP location when offline
+geo_annotate = true
+
+# ── Gossip (inter-agent awareness) ──────────────────────────
+[gossip]
+enabled          = true
+port             = 9999
+bind_addr        = "0.0.0.0"
+# Peers discovered via Nexus or static list
+discovery        = "nexus"          # "nexus" | "static" | "mdns"
+static_peers     = []
+# Encrypt the GOSSIP UDP mesh. Off by default. To encrypt, set true AND set
+# encryption_key (a shared 64-hex key on every peer); true without a key = plaintext.
+encryption       = false
+# encryption_key = "<64 hex chars, same on all peers>"
+gossip_interval_secs = 15
+# What to share with peers
+share_iocs       = true
+share_rules      = false            # Rules come from Nexus only
+share_threat_scores = true
+
+# ── Self-protection (MITRE ATLAS aligned) ────────────────────
+[self_protect]
+enabled                      = true
+watchdog_interval_secs       = 30
+integrity_check_interval_secs = 60
+binary_hash_check            = true
+config_tamper_detection      = true
+# Protect against ATLAS adversarial ML techniques
+adversarial_input_detection  = true
+model_poisoning_detection    = true
+prompt_injection_detection   = true
+# Anti-debug / anti-tamper
+anti_debug                   = true
+protect_pid                  = true
+
+# ── Memory forensics ─────────────────────────────────────────
+[memory]
+enabled             = true
+volatility_path     = "/usr/bin/vol"
+lime_module_path    = "/usr/lib/nebula/lime.ko"
+dump_on_critical    = true
+scan_running_procs  = true
+
+# ── Legacy syslog output ─────────────────────────────────────
+[legacy]
+enabled       = false
+format        = "cef"               # "cef" | "leef" | "syslog_rfc5424"
+target        = "udp://siem:514"
+
+# ── Branding ─────────────────────────────────────────────────
+[branding]
+company_name = "NebulaSentinel"
+product_name = "NebulaSentinel Agent"
+tagline      = "Autonomous Threat Cognition"

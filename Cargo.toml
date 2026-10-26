@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["nebula-agent", "nebula-gossip"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared build profiles for the whole workspace.
+#
+# Cargo only honors [profile.*] when they are declared at the WORKSPACE ROOT;
+# profile sections inside a member crate (e.g. nebula-agent) are ignored with a
+# warning. They are therefore defined once, here, for every member.
+# ─────────────────────────────────────────────────────────────────────────────
+[profile.release]
+opt-level = 3
+lto = "thin"        # thin LTO — faster build, still good optimization
+strip = true
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3        # llama.cpp C++ must build at opt-level 3 for performance
+
+[profile.dev]
+opt-level = 0
+debug = true

@@ -1,0 +1,15 @@
+# Build output
+/target
+target/
+
+# Models and large artifacts are never committed (fetched at runtime)
+*.gguf
+*.zip
+
+# Local editor / tooling state
+.claude/
+.vscode/
+.idea/
+
+# OS cruft
+.DS_Store
