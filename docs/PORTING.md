@@ -35,12 +35,22 @@ in-flight Windows work already underway in nebula-agent.
   - ⚠️ The `#[cfg(windows)]` code is parsed and ported verbatim but was only
     **type-checked on the non-Windows paths here**. A Windows build must verify it.
 
+- **LLM parse-robustness** (`src/llm/mod.rs`) — folded the output-salvage layer
+  into `parse_threat_analysis` without disturbing the Qwen3 catalog / engine-aware
+  selection: `json_prose` (flatten non-string fields), `verdict_from_prose`
+  (leading-word verdict), tolerant `json_bool`, `collect_technique_ids` /
+  `is_mitre_technique_id` (recover + validate MITRE IDs from nested JSON and
+  `next_steps`), and a `has_gguf_magic` guard in `list_gguf_models`. +5 unit tests.
+
 ### ⏳ Remaining
-- **LLM prompt-robustness** (`src/llm/mod.rs` — the real conflict zone, both
-  sides rewrote it): `AtcPromptVariant`, `verdict_from_prose`, tolerant
-  `json_bool`, `collect_technique_ids` / `is_mitre_technique_id`, `raw_generate`
-  + `--llm-inference-test`, local `--list-models`. Must fold in WITHOUT regressing
-  this repo's Qwen3 catalog / engine-aware selection.
+- **LLM extras (deferred, optional)** — `AtcPromptVariant` (env-selectable prompt
+  styles to A/B the 0%-specificity anchoring problem; inert unless
+  `NEBULA_ATC_PROMPT` is set — deferred to avoid disturbing the current default
+  prompt wording), and `raw_generate` + `--llm-inference-test` (a raw "does the
+  backend emit text" check; `--atc-test` already covers the full path). Skipped by
+  design: `is_ternary_model_name` / `REQUIRED_ENGINE` (would regress
+  TQ-under-stock-llama.cpp support) and the `MAX_RESPONSE_TOKENS` cap (a
+  bitnet-only fix).
 - **`platform.rs` config-path overrides** — `set_active_config_path` /
   `active_config_path` (fixes a Windows in-place config-write bug). Deferred: only
   useful once the mode-change handlers (SetMode/ApplyPolicy) call

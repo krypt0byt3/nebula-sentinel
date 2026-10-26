@@ -533,6 +533,194 @@ async fn verify_gguf_magic(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────
+// Model-output robustness helpers
+//
+// Smaller / quantized models (and ternary ones) rarely return the exact JSON
+// the prompt asks for: they wrap it in prose, emit "yes" for a bool, bury
+// technique IDs in nested objects, or lead with the verdict word instead of the
+// key. These helpers salvage the analysis instead of discarding it, which would
+// make a real detection look un-analyzed. Ported from the sentinel_v2 line.
+// ─────────────────────────────────────────────────────────────
+
+/// Cheap sanity check on a candidate model file: it must start with the ASCII
+/// "GGUF" magic. Keeps a half-copied file, an HTML error page saved with a .gguf
+/// name, or a git-LFS pointer out of the candidate list — llama.cpp reacts to
+/// those by aborting the process, not by returning an error.
+fn has_gguf_magic(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"GGUF"
+}
+
+/// Flatten a value that the schema wanted as prose into a readable string.
+fn json_prose(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(a) => {
+            let parts: Vec<String> = a.iter().map(json_prose).filter(|s| !s.is_empty()).collect();
+            // Numbered, because these are almost always ordered steps.
+            if parts.len() > 1 {
+                parts.iter().enumerate()
+                    .map(|(i, p)| format!("({}) {}", i + 1, p))
+                    .collect::<Vec<_>>().join(" ")
+            } else {
+                parts.join(" ")
+            }
+        }
+        serde_json::Value::Object(o) => {
+            // Prefer the keys models actually use for the human-facing part,
+            // rather than dumping raw JSON at an operator.
+            for k in ["action", "step", "description", "text", "summary", "detail", "next_step"] {
+                if let Some(x) = o.get(k) {
+                    let head = json_prose(x);
+                    if !head.is_empty() {
+                        if let Some(r) = o.get("reasoning").or_else(|| o.get("rationale")) {
+                            let why = json_prose(r);
+                            if !why.is_empty() {
+                                return format!("{} — {}", head, why);
+                            }
+                        }
+                        return head;
+                    }
+                }
+            }
+            // Unknown shape: keep the values rather than emitting braces.
+            let parts: Vec<String> = o.values().map(json_prose).filter(|s| !s.is_empty()).collect();
+            parts.join(" — ")
+        }
+    }
+}
+
+/// Recover the verdict from the leading word of the assessment (e.g. a model
+/// that answers "MALICIOUS: …" in prose rather than setting the JSON key). Only
+/// the leading token is examined: scanning the whole sentence would match the
+/// word "malicious" wherever it appears in the reasoning, which is everywhere.
+fn verdict_from_prose(assessment: &str) -> Option<bool> {
+    // Strip decoration the models wrap the verdict in. `<` matters most: asked to
+    // "replace <VERDICT>", some models substitute INTO the brackets and emit
+    // "<MALICIOUS>". The untouched "<VERDICT>" placeholder strips to "VERDICT"
+    // and matches neither arm, so an echoed placeholder is never read as a verdict.
+    let head = assessment
+        .trim_start()
+        .trim_start_matches(['*', '#', '"', '\'', '-', ' ', '<', '[', '(', '`']);
+    let token: String = head.chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match token.as_str() {
+        "MALICIOUS" => Some(true),
+        "BENIGN"    => Some(false),
+        _ => None,
+    }
+}
+
+/// Read a field that should be a boolean, tolerating the shapes models actually
+/// emit: a real bool, the strings "true"/"false"/"yes"/"no", or 0/1. Returns
+/// None when absent or unintelligible, so the caller still decides the fail-safe
+/// default rather than having `false` invented for it.
+fn json_bool(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Number(n) => n.as_i64().map(|i| i != 0),
+        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "y" | "1"  => Some(true),
+            "false" | "no" | "n" | "0"  => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// True for a well-formed MITRE ATT&CK technique ID (T1234 / T1234.001).
+fn is_mitre_technique_id(s: &str) -> bool {
+    let s = s.trim();
+    let Some(rest) = s.strip_prefix('T') else { return false };
+    match rest.split_once('.') {
+        Some((a, b)) => a.len() == 4 && a.chars().all(|c| c.is_ascii_digit())
+                     && b.len() == 3 && b.chars().all(|c| c.is_ascii_digit()),
+        None => rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit()),
+    }
+}
+
+/// Harvest technique IDs from any shape: a bare string, an array of strings, or
+/// an array of objects carrying a nested list. Walks objects so a model that
+/// buries IDs one level down still has them recovered. Validated and
+/// de-duplicated, so prose can never leak into `mitre_refinement`.
+fn collect_technique_ids(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if is_mitre_technique_id(t) && !out.iter().any(|e| e == t) {
+                out.push(t.to_string());
+            }
+        }
+        serde_json::Value::Array(a) => for x in a { collect_technique_ids(x, out) },
+        serde_json::Value::Object(o) => for x in o.values() { collect_technique_ids(x, out) },
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::{verdict_from_prose, json_bool, is_mitre_technique_id, collect_technique_ids, json_prose};
+    use serde_json::json;
+
+    #[test]
+    fn prose_verdict_is_leading_word_only() {
+        assert_eq!(verdict_from_prose("MALICIOUS: lsass memory read"), Some(true));
+        assert_eq!(verdict_from_prose("  <BENIGN> routine admin sweep"), Some(false));
+        assert_eq!(verdict_from_prose("The activity is malicious"), None);
+        assert_eq!(verdict_from_prose("<VERDICT>"), None); // untouched placeholder
+    }
+
+    #[test]
+    fn tolerant_bool() {
+        assert_eq!(json_bool(&json!(true)), Some(true));
+        assert_eq!(json_bool(&json!("yes")), Some(true));
+        assert_eq!(json_bool(&json!("No")), Some(false));
+        assert_eq!(json_bool(&json!(1)), Some(true));
+        assert_eq!(json_bool(&json!(0)), Some(false));
+        assert_eq!(json_bool(&json!("maybe")), None);
+        assert_eq!(json_bool(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn mitre_id_validation() {
+        assert!(is_mitre_technique_id("T1059"));
+        assert!(is_mitre_technique_id("T1003.001"));
+        assert!(!is_mitre_technique_id("T105"));
+        assert!(!is_mitre_technique_id("1059"));
+        assert!(!is_mitre_technique_id("credential access"));
+    }
+
+    #[test]
+    fn technique_recovery_dedups_and_walks_objects() {
+        let v = json!({
+            "refined": ["T1003.001", "not-an-id", {"technique": "T1059.004"}],
+            "dup": "T1003.001"
+        });
+        let mut out = Vec::new();
+        collect_technique_ids(&v, &mut out);
+        out.sort();
+        assert_eq!(out, vec!["T1003.001".to_string(), "T1059.004".to_string()]);
+    }
+
+    #[test]
+    fn prose_flattens_shapes() {
+        assert_eq!(json_prose(&json!("  hi ")), "hi");
+        assert_eq!(json_prose(&json!(["a", "b"])), "(1) a (2) b");
+        assert_eq!(json_prose(&json!({"action": "isolate", "reasoning": "c2 callback"})), "isolate — c2 callback");
+        assert_eq!(json_prose(&serde_json::Value::Null), "");
+    }
+}
+
 /// Every loadable GGUF under `dir`, most recently written first. Descends one
 /// level of subdirectories (operators commonly drop a repo folder in whole), and
 /// skips the trailing pieces of a split model — llama.cpp opens those through
@@ -550,6 +738,10 @@ pub fn list_gguf_models(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             if !md.is_file() || md.len() == 0 { continue; }
             let name = entry.file_name().to_string_lossy().to_string();
             if !is_gguf(&name) || is_split_shard(&name) { continue; }
+            // Drop HTML error pages / LFS pointers / half-copied files saved with
+            // a .gguf name — llama.cpp aborts the process on those rather than
+            // returning an error.
+            if !has_gguf_magic(&path) { continue; }
             out.push((md.modified().unwrap_or(std::time::UNIX_EPOCH), path));
         }
     }
@@ -1821,18 +2013,28 @@ Respond ONLY with valid JSON, no markdown, no prose outside the JSON:
             },
         };
 
-        let is_tp  = json["is_true_positive"].as_bool().unwrap_or(true);
         let adj    = (json["confidence_adjustment"].as_f64().unwrap_or(0.0) as f32).clamp(-30.0, 30.0);
 
         // The enriched prompt returns assessment / benign_explanation / next_steps.
         // Compose them into the single explanation string that already flows to the
         // UI and Nexus, so the richer analysis is preserved without changing the
-        // LLMAnalysis schema. Fall back to the legacy "explanation" key if a model
-        // (or the remote backend) still returns the old shape.
-        let assessment = json["assessment"].as_str().unwrap_or("").trim().to_string();
+        // LLMAnalysis schema. json_prose() flattens the shapes smaller/quantized
+        // models actually emit (a bare string, an array of steps, or objects) so a
+        // non-string field is salvaged rather than silently dropped. Fall back to
+        // the legacy "explanation" key if a model still returns the old shape.
+        let assessment = json_prose(&json["assessment"]);
         let assessment_for_memory = assessment.clone();  // preserved for verdict cache
-        let benign     = json["benign_explanation"].as_str().unwrap_or("").trim().to_string();
-        let next_steps = json["next_steps"].as_str().unwrap_or("").trim().to_string();
+        let benign     = json_prose(&json["benign_explanation"]);
+        let next_steps = json_prose(&json["next_steps"]);
+
+        // Verdict precedence: a prose verdict leading the assessment wins, then a
+        // tolerant read of is_true_positive (bool / "yes" / 1 / …), then the
+        // fail-safe default of true — we never silently suppress an analysis we
+        // couldn't read cleanly. Borrows `assessment` before `expl` moves it.
+        let is_tp = verdict_from_prose(&assessment)
+            .or_else(|| json_bool(&json["is_true_positive"]))
+            .unwrap_or(true);
+
         let expl = if !assessment.is_empty() {
             let mut s = assessment;
             if !benign.is_empty() && benign.to_lowercase() != "none apparent" && benign.to_lowercase() != "none" {
@@ -1843,12 +2045,15 @@ Respond ONLY with valid JSON, no markdown, no prose outside the JSON:
             }
             s
         } else {
-            json["explanation"].as_str().unwrap_or("").to_string()
+            json_prose(&json["explanation"])
         };
 
-        let refined: Vec<String> = json["refined_techniques"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
+        // Recover technique IDs from any shape (bare string, array, or objects
+        // that bury them one level down), validated and de-duplicated, and also
+        // scan next_steps where models sometimes park them.
+        let mut refined: Vec<String> = Vec::new();
+        collect_technique_ids(&json["refined_techniques"], &mut refined);
+        collect_technique_ids(&json["next_steps"], &mut refined);
 
         let generated_rule = if json["generate_rule"].as_bool().unwrap_or(false) {
             let rt = match json["rule_type"].as_str().unwrap_or("yara") {
@@ -1973,7 +2178,11 @@ mod tests {
             ("split-00002-of-00003.gguf", 3),
             ("notes.txt", 3),
         ] {
-            fs::write(dir.join(rel), vec![0u8; bytes]).unwrap();
+            // Real GGUFs begin with the ASCII "GGUF" magic, which list_gguf_models
+            // now verifies; prepend it so the fixtures look like genuine models.
+            let mut data = b"GGUF".to_vec();
+            data.extend(std::iter::repeat(0u8).take(bytes));
+            fs::write(dir.join(rel), data).unwrap();
         }
         std::env::set_var("NEBULA_MODELS_DIR", &dir);
         dir
