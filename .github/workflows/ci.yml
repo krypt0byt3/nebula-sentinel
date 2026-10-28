@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Minimal, C++-toolchain-free feature set (see nebula-agent/Cargo.toml). It
+  # compiles the detection + platform code — including the #[cfg(windows)] paths
+  # in response/forensics/network_monitor/platform — WITHOUT building the
+  # embedded llama.cpp (which needs cmake + a C++ toolchain). yara-x is pure
+  # Rust, so it builds identically on Linux and Windows.
+  AGENT_FEATURES: "ebpf-stub,inventory,gossip,yara"
+
+jobs:
+  # ── Build + unit tests on Linux and Windows ──────────────────────────────
+  # The Windows leg is the one that finally verifies the ported #[cfg(windows)]
+  # code (taskkill /F /T, wevtutil, pktmon, Windows DNS, ProgramData paths),
+  # which until now was only type-checked on the non-Windows paths.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test nebula-gossip
+        run: cargo test -p nebula-gossip --locked
+      - name: Test nebula-agent (no embedded LLM)
+        run: cargo test -p nebula-agent --locked --no-default-features --features "${{ env.AGENT_FEATURES }}"
+
+  # ── Formatting + lints (informational for now) ───────────────────────────
+  # Not required: the current clippy/fmt state is unknown, so these surface
+  # issues without blocking. Flip `continue-on-error` to false (and add
+  # `-D warnings` to clippy) once the tree is clean to make them gates.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy -p nebula-agent --no-default-features --features "${{ env.AGENT_FEATURES }}" -- -W clippy::all
+
+  # ── Dependency vulnerability audit (RUSTSEC) ─────────────────────────────
+  # The tree already carries a hand-pinned `time = "=0.3.47"` for
+  # RUSTSEC-2026-0009 — this automates that kind of advisory tracking so the
+  # next one is caught on push instead of by hand. Informational at first.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit
+
+  # ── Full default build (embedded llama.cpp) ──────────────────────────────
+  # The production default build compiles llama.cpp from source, so it needs a
+  # C++ toolchain + cmake + libclang. Heavy (several minutes), so it only runs
+  # on pushes to main and manual dispatch, not on every PR.
+  build-embedded-llm:
+    name: build (default / embedded-llm)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install C++ / cmake / libclang
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config libssl-dev
+      - name: Build agent with default features
+        run: cargo build -p nebula-agent --locked
