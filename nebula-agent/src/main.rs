@@ -43,6 +43,8 @@ mod ransomware;
 mod dedup;
 mod suppression;
 mod atc_selftest;
+#[cfg(test)]
+mod detection_corpus;
 
 use anyhow::Result;
 use clap::Parser;
