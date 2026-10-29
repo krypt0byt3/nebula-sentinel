@@ -22,6 +22,9 @@ path = "src/main.rs"
 nebula-gossip = { path = "../nebula-gossip" }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# Panic boundary around per-event detectors (FutureExt::catch_unwind). Already
+# in the dependency graph transitively, so declaring it directly pulls no new crate.
+futures-util = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

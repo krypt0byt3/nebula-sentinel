@@ -182,7 +182,7 @@ impl NetworkMonitor {
                             &agent_id, &hostname,
                             "T1071.004",
                             Severity::High,
-                            format!("DNS tunneling pattern: {}", &domain[..domain.len().min(60)]),
+                            format!("DNS tunneling pattern: {}", safe_prefix(domain, 60)),
                             format!("High-entropy DNS query detected: '{}'. Entropy={:.2}, label_len={}. Consistent with DNS tunneling tools (iodine, dnscat2, etc.)", domain, entropy, label_len),
                             80.0,
                             vec![IOC { ioc_type: IOCType::Domain, value: domain.clone(), source: "dns_monitor".into(), confidence: 75.0 }],
@@ -450,6 +450,34 @@ fn shannon_entropy(s: &str) -> f64 {
     freq.iter().filter(|&&c| c > 0)
         .map(|&c| { let p = c as f64 / len; -p * p.log2() })
         .sum()
+}
+
+/// Byte-prefix of `s` up to `max` bytes, floored to a UTF-8 char boundary.
+/// DNS query names come from resolver logs (attacker-influenceable), so
+/// truncating for display goes through here — `&domain[..max]` would panic on a
+/// multibyte char straddling the cut.
+fn safe_prefix(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod safe_prefix_tests {
+    use super::safe_prefix;
+
+    #[test]
+    fn never_panics_on_multibyte_dns_name() {
+        // A high-entropy label with multibyte chars across the 60-byte cut (the
+        // DNS-tunneling display truncation) must not panic.
+        let d = format!("{}é🚀.example.com", "a1b2c3".repeat(12));
+        for n in 0..=d.len() + 4 {
+            let p = safe_prefix(&d, n);
+            assert!(d.starts_with(p));
+            assert!(d.is_char_boundary(p.len()));
+        }
+        assert_eq!(safe_prefix("host", 60), "host");
+    }
 }
 
 fn coefficient_of_variation(v: &[f64]) -> f64 {

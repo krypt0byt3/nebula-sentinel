@@ -282,9 +282,14 @@ impl IaCScanner {
                     "Set encrypted = true. For RDS: storage_encrypted = true. Use KMS CMK for key management."));
             }
 
-            // IAM * policy
-            if l.contains("\"*\"") && (content[..content.len().min(i*80)].to_lowercase().contains("iam") ||
-               content[..content.len().min(i*80)].to_lowercase().contains("policy"))
+            // IAM * policy. The window is a byte-prefix of the file, floored to
+            // a UTF-8 char boundary (safe_prefix) so a multibyte char near the
+            // i*80 cut in a crafted .tf file can't panic the slice. Computed
+            // inside the && so it only runs when the cheap check passes.
+            if l.contains("\"*\"") && {
+                let window = safe_prefix(content, i * 80).to_lowercase();
+                window.contains("iam") || window.contains("policy")
+            }
             {
                 if lines[i.saturating_sub(3)..i].iter().any(|l| l.contains("Action") || l.contains("Resource")) {
                     f.push(finding(path, n, "TF004", "IAM policy with wildcard (*) permissions",
@@ -694,4 +699,33 @@ fn has_tf_files(path: &str) -> bool {
             e.path().extension().and_then(|x| x.to_str()) == Some("tf")
         }))
         .unwrap_or(false)
+}
+
+/// Byte-prefix of `s` up to `max` bytes, floored to a UTF-8 char boundary.
+/// `&s[..max]` panics when `max` lands inside a multibyte character; IaC file
+/// content is untrusted (a crafted `.tf`/`.yaml` could place one across the
+/// cut), so prefixing always goes through here.
+fn safe_prefix(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_prefix;
+
+    #[test]
+    fn safe_prefix_never_panics_on_multibyte() {
+        // A multibyte char ('é' = 2 bytes, '🚀' = 4) straddling the cut must not
+        // panic — the old `&content[..n]` did.
+        let s = "aws_iam_policy_éééé🚀🚀🚀resource";
+        for n in 0..=s.len() + 4 {
+            let p = safe_prefix(s, n);
+            assert!(s.starts_with(p));          // always a valid prefix
+            assert!(s.is_char_boundary(p.len())); // always on a boundary
+        }
+        assert_eq!(safe_prefix("iam", 100), "iam"); // max past end is clamped
+        assert_eq!(safe_prefix("", 5), "");
+    }
 }

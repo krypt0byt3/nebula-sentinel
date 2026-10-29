@@ -137,6 +137,48 @@ struct Args {
     atc_scenario: Option<String>,
 }
 
+/// Run a per-event detector future under a panic boundary.
+///
+/// A security monitor must survive a single malformed or hostile event rather
+/// than crash: the per-event detectors run inline on the main task, so without
+/// this a panic in any one of them (e.g. a crafted event hitting an edge case)
+/// unwinds `main` and the whole agent goes blind — exactly when it's under
+/// attack. Here a detector panic is logged loudly and treated as "no detection
+/// from this detector for this event"; every other detector and the next event
+/// still run. tokio's Mutex does not poison on unwind, so shared detector state
+/// stays usable.
+async fn guarded<T, F>(detector: &str, fut: F) -> Option<T>
+where
+    F: std::future::Future<Output = Option<T>>,
+{
+    use futures_util::future::FutureExt;
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::error!(
+                "detector '{}' panicked on an event — skipped for this event; agent stays up",
+                detector
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod guarded_tests {
+    use super::guarded;
+
+    #[tokio::test]
+    async fn catches_panic_and_passes_values_through() {
+        // A panicking detector yields None instead of unwinding the agent.
+        let out: Option<i32> = guarded("boom", async { panic!("kaboom in a detector") }).await;
+        assert_eq!(out, None);
+        // A healthy detector's verdict passes through untouched.
+        assert_eq!(guarded("ok", async { Some(7) }).await, Some(7));
+        assert_eq!(guarded::<i32, _>("ok", async { None }).await, None);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1461,24 +1503,27 @@ Content: {}",
             }
         }
 
+        // Each detector runs under a panic boundary (see `guarded`): a panic in
+        // one — e.g. from a crafted event — is logged and skipped, never taking
+        // the agent down or stopping the other detectors.
         // ── Ransomware detection ──────────────────────────────
-        let ransom_hit = ransomware_detector.analyze(&event).await;
+        let ransom_hit = guarded("ransomware", ransomware_detector.analyze(&event)).await;
 
         // ── APT behavioral detection ──────────────────────────
-        let apt_hit = apt_detector.analyze(&event).await;
+        let apt_hit = guarded("apt", apt_detector.analyze(&event)).await;
 
         // ── DLP analysis ──────────────────────────────────────
-        let dlp_hit = dlp_engine.analyze(&event).await;
+        let dlp_hit = guarded("dlp", dlp_engine.analyze(&event)).await;
 
         // ── Zero-day behavioral detection ────────────────────
-        let zeroday_hit = zeroday_detector.analyze(&event).await;
+        let zeroday_hit = guarded("zeroday", zeroday_detector.analyze(&event)).await;
 
         // ── Anomaly + rule matching ────────────────────────────
-        let anomaly_hit = anomaly_engine.analyze(&event).await;
+        let anomaly_hit = guarded("anomaly", anomaly_engine.analyze(&event)).await;
 
         // ── Behavioral baseline (learned-normal deviation) ─────
         let baseline_hit = match &baseline_engine {
-            Some(be) => be.analyze(&event).await,
+            Some(be) => guarded("baseline", be.analyze(&event)).await,
             None => None,
         };
 
