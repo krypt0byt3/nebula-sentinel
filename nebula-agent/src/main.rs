@@ -181,6 +181,105 @@ mod guarded_tests {
     }
 }
 
+/// Spawn a long-running scanner loop under supervision.
+///
+/// The agent runs a dozen-plus periodic scanners (posture, secrets, IaC,
+/// container, reputation, YARA-memory, …) as detached `tokio::spawn`ed loops.
+/// Several of them walk **attacker-reachable content** — files dropped in
+/// `/tmp`, process environments, IaC manifests, live process memory. A panic in
+/// any one iteration (a slice on a bad UTF-8 boundary, an `unwrap` on malformed
+/// input) kills that task silently: the scanner is simply gone for the rest of
+/// the process lifetime, with nothing logged, and the agent keeps running while
+/// quietly blind in one dimension — a dangerous failure mode for a security
+/// product.
+///
+/// This wraps such a loop so a panic is caught by the loop task's `JoinHandle`
+/// (`JoinError::is_panic`), logged loudly, and the loop **restarted** after a
+/// short capped backoff. `factory` builds a fresh future on each (re)start, so
+/// it must re-clone anything it captures — it may be called more than once.
+///
+/// A scanner's own loop never returns, so a normal exit is treated as an
+/// intentional stop and is not restarted; a cancellation (runtime shutdown)
+/// likewise ends supervision.
+fn spawn_supervised<F, Fut>(name: &'static str, factory: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restarts: u32 = 0;
+        loop {
+            match tokio::spawn(factory()).await {
+                Ok(()) => {
+                    tracing::warn!("scanner '{}' loop returned; not restarting", name);
+                    break;
+                }
+                Err(e) if e.is_panic() => {
+                    restarts += 1;
+                    // Linear backoff capped at 60s: a transient panic restarts
+                    // promptly, a deterministically-panicking one is logged each
+                    // cycle without spinning the CPU.
+                    let backoff = std::cmp::min(5 * restarts, 60);
+                    tracing::error!(
+                        "scanner '{}' panicked (restart #{}) — respawning in {}s; agent stays up",
+                        name, restarts, backoff
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+                }
+                Err(e) => {
+                    tracing::warn!("scanner '{}' task ended ({}); not restarting", name, e);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod supervised_tests {
+    use super::spawn_supervised;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::time::Duration;
+
+    // `start_paused` makes the supervisor's backoff sleeps advance in virtual
+    // time, so the test is instant rather than waiting real seconds.
+    #[tokio::test(start_paused = true)]
+    async fn restarts_a_panicking_scanner_until_it_sticks() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+
+        let runs_f = runs.clone();
+        let tx_f = tx.clone();
+        spawn_supervised("test", move || {
+            let runs_f = runs_f.clone();
+            let tx_f = tx_f.clone();
+            async move {
+                let n = runs_f.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    panic!("boom {n}"); // first two runs die
+                }
+                // Third run reaches here: signal success, then idle forever so
+                // the supervisor parks on it instead of treating a return as a
+                // deliberate stop.
+                if let Some(tx) = tx_f.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                std::future::pending::<()>().await;
+            }
+        });
+
+        // The factory must be invoked three times (two panics + the sticking
+        // run), proving the supervisor restarted it across panics.
+        tokio::time::timeout(Duration::from_secs(300), rx)
+            .await
+            .expect("supervisor should restart the scanner until the third run")
+            .expect("third run should signal");
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -610,7 +709,15 @@ async fn main() -> Result<()> {
         let _legacy_c       = legacy_bridge.clone();
         let status_posture = status_state.clone();
 
-        tokio::spawn(async move {
+        spawn_supervised("posture", move || {
+          let cfg_c = cfg_c.clone();
+          let nexus_c = nexus_c.clone();
+          let posture_c = posture_c.clone();
+          let inv_c = inv_c.clone();
+          let llm_ctx = llm_ctx.clone();
+          let hardening_c = hardening_c.clone();
+          let status_posture = status_posture.clone();
+          async move {
             // Stagger the first run 30s after startup
             tokio::time::sleep(Duration::from_secs(30)).await;
 
@@ -714,6 +821,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+          }
         });
     }
 
@@ -1267,7 +1375,11 @@ Content: {}",
         let nexus_s     = nexus.clone();
         let secrets_c   = secrets_scanner.clone();
         let zeroday_c   = zeroday_detector.clone();
-        tokio::spawn(async move {
+        spawn_supervised("secrets+zeroday", move || {
+          let nexus_s = nexus_s.clone();
+          let secrets_c = secrets_c.clone();
+          let zeroday_c = zeroday_c.clone();
+          async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(3600));
             loop {
@@ -1284,6 +1396,7 @@ Content: {}",
                     if let Some(ref n) = nexus_s { let _ = n.send_threat(&threat).await; }
                 }
             }
+          }
         });
     }
 
@@ -1295,7 +1408,12 @@ Content: {}",
         let container_c = container_engine.clone();
         let agent_id_c = cfg.agent_id.clone();
         let hostname_c = cfg.hostname.clone();
-        tokio::spawn(async move {
+        spawn_supervised("container", move || {
+          let nexus_c2 = nexus_c2.clone();
+          let container_c = container_c.clone();
+          let agent_id_c = agent_id_c.clone();
+          let hostname_c = hostname_c.clone();
+          async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(600));
             loop {
@@ -1309,6 +1427,7 @@ Content: {}",
                     }
                 }
             }
+          }
         });
     }
 
@@ -1318,7 +1437,10 @@ Content: {}",
     {
         let nexus_iac = nexus.clone();
         let iac_c = iac_scanner.clone();
-        tokio::spawn(async move {
+        spawn_supervised("iac", move || {
+          let nexus_iac = nexus_iac.clone();
+          let iac_c = iac_c.clone();
+          async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(180)).await;
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1800));
             loop {
@@ -1334,6 +1456,7 @@ Content: {}",
                     }
                 }
             }
+          }
         });
     }
 
@@ -1343,7 +1466,10 @@ Content: {}",
     {
         let nexus_rep = nexus.clone();
         let rep_c = reputation_engine.clone();
-        tokio::spawn(async move {
+        spawn_supervised("reputation", move || {
+          let nexus_rep = nexus_rep.clone();
+          let rep_c = rep_c.clone();
+          async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(90)).await;
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(900));
             loop {
@@ -1364,6 +1490,7 @@ Content: {}",
                     }
                 }
             }
+          }
         });
     }
 
@@ -1378,7 +1505,12 @@ Content: {}",
         let nexus_mem = nexus.clone();
         let agent_id_mem = cfg.agent_id.clone();
         let hostname_mem = cfg.hostname.clone();
-        tokio::spawn(async move {
+        spawn_supervised("yara-memory", move || {
+          let yara_mem = yara_mem.clone();
+          let nexus_mem = nexus_mem.clone();
+          let agent_id_mem = agent_id_mem.clone();
+          let hostname_mem = hostname_mem.clone();
+          async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1800));
             loop {
@@ -1426,6 +1558,7 @@ Content: {}",
                     }
                 }
             }
+          }
         });
     }
 

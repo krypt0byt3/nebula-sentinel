@@ -198,6 +198,15 @@ system-configuration = { version = "0.5", optional = true }
 # local-syslog-socket path of the legacy bridge.
 syslog = "7"
 
+# ── Dev-only dependencies ─────────────────────────────────────────────────
+# resolver = "2" keeps dev-dependency features out of the production `cargo
+# build`, so enabling tokio's `test-util` here (for `#[tokio::test(start_paused
+# = true)]` — used by the scanner-supervisor restart test) does not pull the
+# test machinery into the shipped binary. test-util adds no new crates, so
+# Cargo.lock is unchanged and the CI `--locked` build still resolves.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [features]
 # Default build: embedded llama.cpp (like the Nexus — local inference, no Ollama,
 # no external runtime or server process). Requires a C++ toolchain to compile
