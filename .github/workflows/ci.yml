@@ -53,6 +53,8 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
+        # Run even when rustfmt reports diffs, so we still get the clippy signal.
+        if: always()
         run: cargo clippy -p nebula-agent --no-default-features --features "${{ env.AGENT_FEATURES }}" -- -W clippy::all
 
   # ── Dependency vulnerability audit (RUSTSEC) ─────────────────────────────
