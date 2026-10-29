@@ -152,6 +152,29 @@ fn tier(confidence: f32, pid: u32) -> (Severity, ResponseAction) {
     }
 }
 
+/// Does the spawned child match an ancestry rule's `child_pat`?
+///
+/// `child_pat` is either a command fragment (contains a space, e.g. `"bash -i"`)
+/// or a process-name stem (e.g. `"sh"`, `"python"`). The old test was a plain
+/// substring over both the process name and the command line, which
+/// over-matched badly: `"sh"` matched `ssh`/`sshd`/`bash`/`dash`/`flush`, so an
+/// nginx worker launching `ssh` looked like a webshell. This matches a
+/// process-name stem only as a **prefix of the executable basename** — of the
+/// process name and of the command's argv[0] — so `"sh"` matches `sh` and
+/// `/bin/sh -c …` but not `ssh`/`bash`, while version-suffixed interpreters
+/// (`python3`, `nodejs`) still match their stem. Command fragments keep the
+/// substring test so `"bash -i"` still works.
+fn child_matches(proc_lower: &str, cmd_lower: &str, child_pat: &str) -> bool {
+    if child_pat.contains(' ') {
+        return cmd_lower.contains(child_pat);
+    }
+    let basename_has_stem = |s: &str| {
+        s.rsplit(['/', '\\']).next().unwrap_or(s).starts_with(child_pat)
+    };
+    basename_has_stem(proc_lower)
+        || cmd_lower.split_whitespace().next().map(basename_has_stem).unwrap_or(false)
+}
+
 pub struct ZeroDayDetector {
     agent_id: String,
     hostname: String,
@@ -201,7 +224,7 @@ impl ZeroDayDetector {
 
             for (parent_pat, child_pat, technique, confidence, desc) in ANOMALOUS_ANCESTRY {
                 if parent_lower.contains(parent_pat) &&
-                   (proc_lower.contains(child_pat) || cmd_lower.contains(child_pat))
+                   child_matches(&proc_lower, &cmd_lower, child_pat)
                 {
                     warn!("🎯 ZERO-DAY: {} → {} [{technique}] ({:.0}%)", parent_name, event.process_name, confidence);
                     return Some(self.make_zeroday_threat(
@@ -422,5 +445,36 @@ mod tests {
         // not be auto-killed.
         assert!(t.confidence < 75.0, "sshd→bash -i is normally a login, got {}", t.confidence);
         assert!(!matches!(t.suggested_action, ResponseAction::KillProcess(_)));
+    }
+
+    #[tokio::test]
+    async fn substring_lookalikes_do_not_false_match() {
+        // nginx launching `ssh` must NOT trip the nginx→"sh" rule: "ssh" is not
+        // a shell. The old substring match (`"ssh".contains("sh")`) fired here.
+        let d = ZeroDayDetector::new("a", "h");
+        let _ = d.analyze(&exec_event(100, 1, "nginx", "nginx: worker")).await;
+        assert!(
+            d.analyze(&exec_event(200, 100, "ssh", "ssh backup@host")).await.is_none(),
+            "nginx → ssh must not match the shell rule"
+        );
+        // But nginx launching a real shell via an absolute path still matches.
+        let d2 = ZeroDayDetector::new("a", "h");
+        let _ = d2.analyze(&exec_event(300, 1, "nginx", "nginx: worker")).await;
+        let hit = d2.analyze(&exec_event(400, 300, "sh", "/bin/sh -c id")).await
+            .expect("nginx → /bin/sh must still be caught");
+        assert!(hit.confidence >= 90.0);
+    }
+
+    #[test]
+    fn child_matches_stem_prefix_not_substring() {
+        // process-name stems match as basename prefixes, not substrings
+        assert!(child_matches("sh", "/bin/sh -c id", "sh"));
+        assert!(child_matches("python3", "python3 x.py", "python"));  // version suffix ok
+        assert!(child_matches("bash", "/bin/bash", "bash"));
+        assert!(!child_matches("ssh", "ssh host", "sh"));              // the old false match
+        assert!(!child_matches("bash", "bash x", "sh"));
+        // command fragments (with a space) keep the substring test
+        assert!(child_matches("bash", "bash -i", "bash -i"));
+        assert!(!child_matches("bash", "bash -c id", "bash -i"));
     }
 }
