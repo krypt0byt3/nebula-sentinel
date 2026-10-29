@@ -250,25 +250,66 @@ impl RansomwareDetector {
         let is_ransom_note = note_set.contains(&fname_lc);
         if is_ransom_note && !rec.ransom_note_found {
             rec.ransom_note_found = true;
-            warn!("🔴 RANSOMWARE: Ransom note created by pid={} ({}): {}",
-                event.pid, event.process_name, path);
 
-            return Some(self.make_ransomware_threat(
-                Severity::Critical,
-                96.0,
-                format!("Ransomware: ransom note created by {} (pid={})",
-                    event.process_name, event.pid),
+            // A *distinctive* ransom-note name (HOW_TO_DECRYPT.txt,
+            // YOUR_FILES_ARE_ENCRYPTED.txt, @Please_Read_Me@.txt, …) is a
+            // definitive indicator on its own. A *generic* name (README.txt,
+            // NOTICE.txt, IMPORTANT.txt, …) is used constantly by benign software
+            // — a git clone, a tarball extract, an installer — so on its own it
+            // must NOT drive a destructive auto-response. A generic name reaches
+            // the high-confidence tier only when this same process has ALSO
+            // written files with known ransomware extensions (i.e. it is actually
+            // encrypting, not just dropping a readme). Intel-supplied note names
+            // are not in the generic set, so they stay definitive.
+            let generic = is_generic_note_name(&fname_lc);
+            let corroborated = rec.encrypted_ext_count >= 1;
+
+            if !generic || corroborated {
+                warn!("🔴 RANSOMWARE: Ransom note created by pid={} ({}): {}",
+                    event.pid, event.process_name, path);
+                return Some(self.make_ransomware_threat(
+                    Severity::Critical,
+                    96.0,
+                    format!("Ransomware: ransom note created by {} (pid={})",
+                        event.process_name, event.pid),
+                    format!(
+                        "Ransom note '{}' was created by process '{}' (pid={}). \
+                         This is a definitive ransomware indicator. \
+                         The process should be killed immediately and the affected \
+                         directories examined for encrypted files.",
+                        filename, event.process_name, event.pid
+                    ),
+                    event.pid,
+                    path,
+                    "T1486",
+                ));
+            }
+
+            // Generic name, not corroborated → low-confidence alert only. The
+            // suggested action is downgraded from the builder's default (Kill) to
+            // a plain Alert, so even a mis-tuned responder cannot auto-kill on a
+            // bare README/NOTICE/IMPORTANT write.
+            warn!("🟠 RANSOMWARE(watch): generic ransom-note name '{}' by pid={} ({}) — \
+                   alert only; not auto-actioned without a corroborating ransom-extension write",
+                filename, event.pid, event.process_name);
+            let mut threat = self.make_ransomware_threat(
+                Severity::Medium,
+                70.0,
+                format!("Possible ransom note (unconfirmed): '{}' by {} (pid={})",
+                    filename, event.process_name, event.pid),
                 format!(
-                    "Ransom note '{}' was created by process '{}' (pid={}). \
-                     This is a definitive ransomware indicator. \
-                     The process should be killed immediately and the affected \
-                     directories examined for encrypted files.",
+                    "A file named '{}' was created by '{}' (pid={}). This name is used by \
+                     some ransomware families but also constantly by benign software, so it \
+                     is reported as a low-confidence alert. It is NOT auto-actioned unless \
+                     this process also writes files with known ransomware extensions.",
                     filename, event.process_name, event.pid
                 ),
                 event.pid,
                 path,
                 "T1486",
-            ));
+            );
+            threat.suggested_action = ResponseAction::Alert;
+            return Some(threat);
         }
 
         // ── Check 2: Known ransomware extension ───────────────
@@ -533,6 +574,20 @@ impl RansomwareDetector {
             auto_generated_rule: None,
         }
     }
+}
+
+/// Generic note filenames that are common in benign software (README, NOTICE,
+/// IMPORTANT, …) as well as in some ransomware. A match on one of these is
+/// downgraded to a low-confidence alert unless corroborated by ransom-extension
+/// writes from the same process — see `analyze_file_event` Check 1. Distinctive
+/// note names (HOW_TO_DECRYPT.txt, YOUR_FILES_ARE_ENCRYPTED.txt,
+/// @Please_Read_Me@.txt, …) are deliberately NOT listed here and stay definitive
+/// on their own. Compared against the already-lowercased filename.
+fn is_generic_note_name(fname_lc: &str) -> bool {
+    matches!(
+        fname_lc,
+        "readme.txt" | "readme.html" | "read_me.txt" | "notice.txt" | "important.txt"
+    )
 }
 
 // ─────────────────────────────────────────────────────────────

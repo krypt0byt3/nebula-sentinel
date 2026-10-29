@@ -195,7 +195,30 @@ fn ransomware_scenarios() -> Vec<Scenario> {
             events: vec![exec(303, 1, "chmod", "chmod -R 000 /home/alice")],
             expect_high_conf: true,
         },
+        Scenario {
+            // A generic note name (README.txt) is normally alert-only, but once
+            // the SAME process has written a known-ransom-extension file it is
+            // corroborated and escalates to the auto-kill tier.
+            name: "generic note README.txt corroborated by a .locked write (96.0)",
+            events: vec![
+                file_write(309, "cryptor", "/home/alice/notes.docx.locked"),
+                file_write(309, "cryptor", "/home/alice/README.txt"),
+            ],
+            expect_high_conf: true,
+        },
         // ── Benign / weak: must NOT reach the auto-kill tier ──
+        Scenario {
+            // The flagged false-positive: a bare README.txt (git clone, tarball,
+            // installer) must stay an alert, never auto-kill.
+            name: "benign README.txt alone (generic note, uncorroborated → alert 70.0)",
+            events: vec![file_write(310, "git", "/home/alice/repo/README.txt")],
+            expect_high_conf: false,
+        },
+        Scenario {
+            name: "benign NOTICE.txt alone (generic note → alert)",
+            events: vec![file_write(311, "tar", "/home/alice/pkg/NOTICE.txt")],
+            expect_high_conf: false,
+        },
         Scenario {
             name: "backup service stopped (pre-encryption signal, alert-only 82.0)",
             events: vec![exec(304, 1, "systemctl", "systemctl stop veeam")],
