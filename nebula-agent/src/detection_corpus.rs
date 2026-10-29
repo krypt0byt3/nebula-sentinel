@@ -19,6 +19,7 @@
 //! hand-verified so the asserted precision/recall stays at 1.0 — a drop means a
 //! real regression, not a flaky test.
 
+use crate::ransomware::RansomwareDetector;
 use crate::types::{EventType, RawEvent};
 use crate::zeroday::ZeroDayDetector;
 use chrono::Utc;
@@ -73,6 +74,18 @@ fn exec(pid: u32, ppid: u32, name: &str, cmd: &str) -> RawEvent {
 /// the shape the zeroday ancestry rules key on.
 fn lineage(parent: &str, child: &str, child_cmd: &str) -> Vec<RawEvent> {
     vec![exec(100, 1, parent, parent), exec(200, 100, child, child_cmd)]
+}
+
+/// A file-write event by `pid`/`process_name` touching `path`. Built from `exec`
+/// so every unrelated field keeps the same benign default, then re-typed as a
+/// write with a file path and no command line (the ransomware file checks key on
+/// `file_path`, not `command_line`).
+fn file_write(pid: u32, process_name: &str, path: &str) -> RawEvent {
+    let mut e = exec(pid, 1, process_name, "");
+    e.event_type = EventType::FileWrite;
+    e.file_path = Some(path.into());
+    e.command_line = None;
+    e
 }
 
 fn zeroday_scenarios() -> Vec<Scenario> {
@@ -141,4 +154,124 @@ async fn zeroday_corpus_precision_recall() {
     // dropping a real server-compromise pattern — breaks one of these.
     assert_eq!(fp, 0, "high-confidence detection on a benign/weak scenario (would auto-act)");
     assert_eq!(fn_, 0, "missed a real high-confidence threat");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ransomware corpus
+//
+// Only the *deterministic* ransomware detections are encoded here — the ones
+// whose verdict depends purely on the event, not on real on-disk file entropy,
+// wall-clock write rate, or the 30s background sweeper. (The mass-high-entropy
+// and rate-based paths read actual files and real elapsed time, so they can't be
+// asserted hermetically and are deliberately excluded.) Every true positive is a
+// known pre-encryption / encryption / recovery-inhibition indicator; every
+// benign case stays below the auto-kill tier.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn ransomware_scenarios() -> Vec<Scenario> {
+    vec![
+        // ── True positives: should reach the auto-response tier ──
+        Scenario {
+            name: "ransom note HOW_TO_DECRYPT.txt created (96.0)",
+            events: vec![file_write(300, "cryptor", "/home/alice/HOW_TO_DECRYPT.txt")],
+            expect_high_conf: true,
+        },
+        Scenario {
+            name: "three files with a known ransom extension (.locked, 97.0)",
+            events: vec![
+                file_write(301, "cryptor", "/home/alice/a.docx.locked"),
+                file_write(301, "cryptor", "/home/alice/b.xlsx.locked"),
+                file_write(301, "cryptor", "/home/alice/c.pdf.locked"),
+            ],
+            expect_high_conf: true,
+        },
+        Scenario {
+            name: "vssadmin deletes shadow copies (recovery inhibition, 93.0)",
+            events: vec![exec(302, 1, "vssadmin", "vssadmin delete shadows /all /quiet")],
+            expect_high_conf: true,
+        },
+        Scenario {
+            name: "mass chmod 000 on /home (destruction, 90.0)",
+            events: vec![exec(303, 1, "chmod", "chmod -R 000 /home/alice")],
+            expect_high_conf: true,
+        },
+        // ── Benign / weak: must NOT reach the auto-kill tier ──
+        Scenario {
+            name: "backup service stopped (pre-encryption signal, alert-only 82.0)",
+            events: vec![exec(304, 1, "systemctl", "systemctl stop veeam")],
+            expect_high_conf: false,
+        },
+        Scenario {
+            name: "ordinary document save (no indicator)",
+            events: vec![file_write(305, "libreoffice", "/home/alice/report.pdf")],
+            expect_high_conf: false,
+        },
+        Scenario {
+            name: "service writes its config (no indicator)",
+            events: vec![file_write(306, "app", "/etc/app/config.yaml")],
+            expect_high_conf: false,
+        },
+        Scenario {
+            name: "build emits object files (benign, not a ransom extension)",
+            events: vec![
+                file_write(307, "cc1", "/home/alice/proj/parser.o"),
+                file_write(307, "cc1", "/home/alice/proj/lexer.o"),
+                file_write(307, "cc1", "/home/alice/proj/main.o"),
+            ],
+            expect_high_conf: false,
+        },
+        Scenario {
+            name: "routine process exec (ls)",
+            events: vec![exec(308, 1, "ls", "ls -la /home/alice")],
+            expect_high_conf: false,
+        },
+    ]
+}
+
+/// Highest confidence the ransomware detector assigns across a scenario's events
+/// (None if it never fires). A fresh detector per scenario keeps the per-pid file
+/// activity isolated; the returned mpsc receiver is dropped (unused here).
+async fn ransomware_peak_confidence(events: &[RawEvent]) -> Option<f32> {
+    let (d, _rx) = RansomwareDetector::new("corpus", "host");
+    let mut peak: Option<f32> = None;
+    for e in events {
+        if let Some(t) = d.analyze(e).await {
+            peak = Some(peak.map_or(t.confidence, |m| m.max(t.confidence)));
+        }
+    }
+    peak
+}
+
+#[tokio::test]
+async fn ransomware_corpus_precision_recall() {
+    let scenarios = ransomware_scenarios();
+    let (mut tp, mut fp, mut tn, mut fn_) = (0u32, 0u32, 0u32, 0u32);
+
+    for s in &scenarios {
+        let got_high = ransomware_peak_confidence(&s.events)
+            .await
+            .map(|c| c >= HIGH_CONF)
+            .unwrap_or(false);
+        match (s.expect_high_conf, got_high) {
+            (true, true) => tp += 1,
+            (false, false) => tn += 1,
+            (true, false) => {
+                fn_ += 1;
+                eprintln!("  FALSE NEGATIVE — missed real threat: {}", s.name);
+            }
+            (false, true) => {
+                fp += 1;
+                eprintln!("  FALSE POSITIVE — would auto-act on benign: {}", s.name);
+            }
+        }
+    }
+
+    let precision = if tp + fp == 0 { 1.0 } else { tp as f64 / (tp + fp) as f64 };
+    let recall = if tp + fn_ == 0 { 1.0 } else { tp as f64 / (tp + fn_) as f64 };
+    eprintln!(
+        "ransomware corpus: TP={tp} FP={fp} TN={tn} FN={fn_} | precision={precision:.3} recall={recall:.3}"
+    );
+
+    assert_eq!(fp, 0, "high-confidence ransomware detection on a benign scenario (would auto-act)");
+    assert_eq!(fn_, 0, "missed a real high-confidence ransomware threat");
 }
